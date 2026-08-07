@@ -6,7 +6,7 @@ class SectorAnalyzer(BaseAnalyzer):
     """업종 분석기"""
     
     def __init__(self):
-        super().__init__(name="sector", weight=0.20)
+        super().__init__(name="sector", weight=0.18)
     
     def validate(self, data: Dict[str, Any]) -> bool:
         """데이터 검증"""

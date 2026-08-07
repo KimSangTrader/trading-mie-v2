@@ -6,7 +6,7 @@ class NewsAnalyzer(BaseAnalyzer):
     """뉴스 분석기"""
     
     def __init__(self):
-        super().__init__(name="news", weight=0.10)
+        super().__init__(name="news", weight=0.09)
     
     def validate(self, data: Dict[str, Any]) -> bool:
         """데이터 검증"""

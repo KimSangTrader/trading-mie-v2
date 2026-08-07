@@ -6,7 +6,7 @@ class MoneyFlowAnalyzer(BaseAnalyzer):
     """수급 분석기"""
     
     def __init__(self):
-        super().__init__(name="moneyflow", weight=0.15)
+        super().__init__(name="moneyflow", weight=0.14)
     
     def validate(self, data: Dict[str, Any]) -> bool:
         """데이터 검증"""
