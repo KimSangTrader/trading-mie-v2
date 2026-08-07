@@ -16,7 +16,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Setup SSH
       run: |
@@ -55,12 +55,12 @@ jobs:
     - name: Deployment notification
       if: success()
       run: |
-        echo "✅ Deployment to EC2 completed successfully!"
+        echo "??Deployment to EC2 completed successfully!"
         echo "Host: ${{ secrets.EC2_HOST }}"
         echo "Timestamp: $(date)"
     
     - name: Deployment error notification
       if: failure()
       run: |
-        echo "❌ Deployment to EC2 failed!"
+        echo "??Deployment to EC2 failed!"
         exit 1
