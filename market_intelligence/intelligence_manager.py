@@ -54,58 +54,80 @@ class IntelligenceManager:
     
     def run_all(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        모든 분석기 실행
+        모든 등록된 분석기 실행
         
         Args:
-            data: 모든 분석기에 필요한 데이터
-            
+            data: 분석 데이터
+        
         Returns:
-            {
-                "final_score": float,
-                "by_analyzer": [...],
-                "timestamp": str,
-                "success_count": int,
-                "fail_count": int
-            }
+            모든 분석기의 결과 종합
         """
         logger.info(f"Running {len(self.analyzers)} analyzers...")
         
-        results = []
-        success_count = 0
-        fail_count = 0
+        individual_scores = {}
+        total_weighted_score = 0
         total_weight = 0
-        weighted_score = 0
+        errors = []
         
-        # 1. 모든 분석기 실행
-        for name, analyzer in self.analyzers.items():
-            result = analyzer.run(data)
-            results.append(result)
+        try:
+            # 1. 각 분석기 실행
+            for analyzer_name, analyzer in self.analyzers.items():
+                try:
+                    # validate 확인
+                    if not analyzer.validate(data):
+                        logger.warning(f"Validation failed for {analyzer_name}")
+                        continue
+                    
+                    # analyze 실행
+                    result = analyzer.run(data)  # run() 메소드 사용
+                    
+                    score = result.get("score", 0)
+                    weight = analyzer.weight
+                    
+                    individual_scores[analyzer_name] = {
+                        "score": score,
+                        "weight": weight,
+                        "timestamp": result.get("timestamp")
+                    }
+                    
+                    total_weighted_score += score * weight
+                    total_weight += weight
+                    
+                except Exception as e:
+                    logger.error(f"Error in {analyzer_name}: {str(e)}")
+                    errors.append({
+                        "analyzer": analyzer_name,
+                        "error": str(e)
+                    })
             
-            if result["success"]:
-                success_count += 1
-                total_weight += result["weight"]
-                weighted_score += result["score"] * result["weight"]
+            # 2. 최종 점수 계산
+            if total_weight > 0:
+                final_score = total_weighted_score / total_weight
             else:
-                fail_count += 1
-        
-        # 2. 최종 점수 계산
-        if total_weight > 0:
-            final_score = weighted_score / total_weight
-        else:
-            final_score = 0
-        
-        # 3. 결과 저장 및 반환
-        self.last_run_time = datetime.utcnow()
-        self.final_scores = results
-        
-        return {
-            "final_score": round(final_score, 2),
-            "by_analyzer": results,
-            "timestamp": self.last_run_time.isoformat(),
-            "success_count": success_count,
-            "fail_count": fail_count,
-            "total_analyzers": len(self.analyzers)
-        }
+                final_score = 0
+            
+            # 3. 결과 반환
+            self.last_run_time = datetime.utcnow()
+            
+            return {
+                "success": True,  # ← 추가!
+                "error": None,    # ← 추가!
+                "individual_scores": individual_scores,
+                "final_score": final_score,
+                "total_weight": total_weight,
+                "timestamp": self.last_run_time.isoformat(),
+                "errors": errors if errors else None
+            }
+            
+        except Exception as e:
+            logger.error(f"run_all() failed: {str(e)}")
+            return {
+                "success": False,  # ← 추가!
+                "error": str(e),   # ← 추가!
+                "individual_scores": {},
+                "final_score": 0,
+                "timestamp": datetime.utcnow().isoformat()
+            }
     
     def get_summary(self) -> Dict[str, Any]:
         """최근 분석 결과 요약"""
