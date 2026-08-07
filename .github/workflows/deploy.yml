@@ -1,0 +1,66 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types: [completed]
+    branches: [ main ]
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event.workflow_run.conclusion == 'success')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+    
+    - name: Copy files to EC2
+      run: |
+        scp -r -o StrictHostKeyChecking=no \
+          market_intelligence/ \
+          tests/ \
+          main.py \
+          requirements.txt \
+          deploy.sh \
+          ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ secrets.EC2_DEPLOY_DIR }}/
+    
+    - name: Run deployment script
+      run: |
+        ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+          "cd ${{ secrets.EC2_DEPLOY_DIR }} && bash deploy.sh"
+    
+    - name: Verify deployment
+      run: |
+        ssh -o StrictHostKeyChecking=no \
+          ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+          "sudo systemctl status mie-v2 --no-pager"
+    
+    - name: Cleanup SSH key
+      if: always()
+      run: |
+        rm -f ~/.ssh/id_rsa
+    
+    - name: Deployment notification
+      if: success()
+      run: |
+        echo "✅ Deployment to EC2 completed successfully!"
+        echo "Host: ${{ secrets.EC2_HOST }}"
+        echo "Timestamp: $(date)"
+    
+    - name: Deployment error notification
+      if: failure()
+      run: |
+        echo "❌ Deployment to EC2 failed!"
+        exit 1
