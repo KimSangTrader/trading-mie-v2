@@ -21,7 +21,8 @@ class IntelligenceManager:
         """초기화"""
         self.analyzers: Dict[str, BaseAnalyzer] = {}
         self.final_scores: List[Dict[str, Any]] = []
-        self.last_run_time = None
+        self.last_run_time: Optional[datetime] = None
+        self.last_results: Optional[Dict[str, Any]] = None  # ← 추가!
         
     def register_analyzer(self, analyzer: BaseAnalyzer) -> None:
         """
@@ -68,6 +69,8 @@ class IntelligenceManager:
         total_weighted_score = 0
         total_weight = 0
         errors = []
+        success_count = 0
+        fail_count = 0  # ← fail_count로 변경!
         
         try:
             # 1. 각 분석기 실행
@@ -76,10 +79,11 @@ class IntelligenceManager:
                     # validate 확인
                     if not analyzer.validate(data):
                         logger.warning(f"Validation failed for {analyzer_name}")
+                        fail_count += 1  # ← fail_count로 변경!
                         continue
                     
                     # analyze 실행
-                    result = analyzer.run(data)  # run() 메소드 사용
+                    result = analyzer.run(data)
                     
                     score = result.get("score", 0)
                     weight = analyzer.weight
@@ -92,6 +96,7 @@ class IntelligenceManager:
                     
                     total_weighted_score += score * weight
                     total_weight += weight
+                    success_count += 1
                     
                 except Exception as e:
                     logger.error(f"Error in {analyzer_name}: {str(e)}")
@@ -99,6 +104,7 @@ class IntelligenceManager:
                         "analyzer": analyzer_name,
                         "error": str(e)
                     })
+                    fail_count += 1  # ← fail_count로 변경!
             
             # 2. 최종 점수 계산
             if total_weight > 0:
@@ -106,45 +112,58 @@ class IntelligenceManager:
             else:
                 final_score = 0
             
-            # 3. 결과 반환
+            # 3. 결과 저장
             self.last_run_time = datetime.utcnow()
-            
-            return {
-                "success": True,  # ← 추가!
-                "error": None,    # ← 추가!
+            self.last_results = {
+                "success": True,
+                "error": None,
                 "individual_scores": individual_scores,
                 "final_score": final_score,
                 "total_weight": total_weight,
-                "timestamp": self.last_run_time.isoformat(),
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "total_analyzers": len(self.analyzers),  # ← 추가!
+                "analyzed_at": self.last_run_time.isoformat(),
                 "errors": errors if errors else None
             }
             
+            return self.last_results
+            
         except Exception as e:
             logger.error(f"run_all() failed: {str(e)}")
-            return {
-                "success": False,  # ← 추가!
-                "error": str(e),   # ← 추가!
+            self.last_run_time = datetime.utcnow()
+            result = {
+                "success": False,
+                "error": str(e),
                 "individual_scores": {},
                 "final_score": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "success_count": 0,
+                "fail_count": len(self.analyzers),
+                "total_analyzers": len(self.analyzers),  # ← 추가!
+                "analyzed_at": self.last_run_time.isoformat()
             }
-    
+            self.last_results = result
+            return result
+        
     def get_summary(self) -> Dict[str, Any]:
-        """최근 분석 결과 요약"""
-        if not self.final_scores:
+        """
+        최종 분석 결과 요약 반환
+        
+        Returns:
+            최종 점수, 타임스탐프, 에러 포함
+        """
+        if self.last_results is None:
             return {"error": "No analysis has been run yet"}
         
-        total_weight = sum(r.get("weight", 1) for r in self.final_scores)
-        if total_weight == 0:
-            final_score = 0
-        else:
-            final_score = sum(r.get("score", 0) * r.get("weight", 1) 
-                             for r in self.final_scores) / total_weight
-        
         return {
-            "final_score": round(final_score, 2),
-            "analyzed_at": self.last_run_time.isoformat() if self.last_run_time else "Not run yet",
-            "analyzers_run": len([r for r in self.final_scores if r.get("success")])
+            "final_score": self.last_results.get("final_score", 0),
+            "success": self.last_results.get("success", False),
+            "success_count": self.last_results.get("success_count", 0),
+            "fail_count": self.last_results.get("fail_count", 0),
+            "analyzers_run": self.last_results.get("success_count", 0),  # ← 추가!
+            "analyzed_at": self.last_results.get("analyzed_at"),
+            "individual_scores": self.last_results.get("individual_scores", {}),
+            "errors": self.last_results.get("errors")
         }
     
     def get_analyzer(self, name: str) -> BaseAnalyzer:
