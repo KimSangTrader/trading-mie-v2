@@ -1,14 +1,15 @@
-# Auto detect text files and normalize line endings to LF
+# 모든 파일: auto 모드 (자동 변환)
 * text=auto
 
-# Shell scripts and Python files should use LF (Unix line endings)
-*.sh text eol=lf
+# Python 파일: LF 유지
 *.py text eol=lf
-*.md text eol=lf
-Makefile text eol=lf
-deploy.sh text eol=lf
+*.sh text eol=lf
 
-# Windows batch files should use CRLF
+# Windows 배치 파일: CRLF 유지
 *.bat text eol=crlf
 *.cmd text eol=crlf
-*.ps1 text eol=crlf
+
+# 바이너리 파일: 변환 안 함
+*.db binary
+*.sqlite binary
+*.pyc binary
