@@ -1,13 +1,12 @@
 """
 KIS API 클라이언트 (환경별 자동 선택)
 한국투자증권 실시간 시장 데이터 조회
-【최종 수정】샘플 코드 방식 적용 - FHPUP02120000 (지수전용 API)
+【수정사항】과거 60일 데이터 CTS 페이지네이션으로 자동 수집
 """
 
 import requests
 import json
 import os
-import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -199,6 +198,10 @@ class KISClient:
                 print(f"   ✅ KOSDAQ: {kosdaq_data['kosdaq_index']}")
             else:
                 print(f"   ❌ KOSDAQ 조회 실패: {response_kosdaq.status_code}")
+                print(f"   응답 헤더: {dict(response_kosdaq.headers)}")
+                print(f"   응답 본문: {response_kosdaq.text[:200]}")
+                print(f"   요청 URL: {response_kosdaq.url}")
+                print(f"   요청 파라미터: {params_kosdaq}")
             
             # 결과 통합
             result = {
@@ -215,14 +218,83 @@ class KISClient:
             import traceback
             traceback.print_exc()
             return {}
+    
+    def get_historical_data(self, days=60) -> Dict:
+        """KOSPI 일별 시세 데이터 조회 (과거 60일)"""
+        try:
+            print(f"\n기술 지표용 KOSPI 일별 데이터 조회 중 ({days}일)...")
+            
+            if not self.access_token:
+                if not self.get_access_token():
+                    return {}
+            
+            # 【주식 현재가 API】로 일별 데이터 조회
+            # TR_ID: FHKST01010400 (일자별 조회)
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+            
+            headers = {
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.api_key,
+                "appsecret": self.api_secret,
+                "tr_id": "FHKST01010400",
+                "custtype": "P"
+            }
+            
+            params = {
+                "fid_cond_mrkt_div_code": "U",      # 유가증권
+                "fid_input_iscd": "0001",            # KOSPI
+                "fid_period_div_code": "D",          # Daily
+                "fid_output_div_code": "D"           # 상세
+            }
+            
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                verify=False,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                output_list = data.get('output1', [])
+                
+                # 과거 N일치 데이터 정렬
+                historical_data = {
+                    "dates": [],
+                    "opens": [],
+                    "highs": [],
+                    "lows": [],
+                    "closes": [],
+                    "volumes": []
+                }
+                
+                for item in output_list[:days]:
+                    historical_data['dates'].append(item.get('stck_bsop_date'))
+                    historical_data['opens'].append(float(item.get('stck_oprc', 0)))
+                    historical_data['highs'].append(float(item.get('stck_hgpr', 0)))
+                    historical_data['lows'].append(float(item.get('stck_lwpr', 0)))
+                    historical_data['closes'].append(float(item.get('stck_clpr', 0)))
+                    historical_data['volumes'].append(int(item.get('acml_vol', 0)))
+                
+                print(f"✅ {len(historical_data['dates'])}일치 데이터 수집 완료")
+                return historical_data
+                
+            else:
+                print(f"❌ 일별 데이터 조회 실패: {response.status_code}")
+                return {}
+                
+        except Exception as e:
+            print(f"❌ 일별 데이터 조회 오류: {e}")
+            return {}
 
     def get_daily_price(self, stock_code: str, days: int = 60) -> Dict:
         """
         일별 시세 데이터 조회 (과거 60일 보장)
-        【샘플 코드 방식 적용】
-        - FHPUP02120000 (국내업종 일자별지수 API) 사용
-        - FID_INPUT_DATE_1 기준 날짜부터 과거 방향으로 ~100개 캔들 반환
-        - END_DATE부터 시작해서 역순 순회
+        【수정사항】
+        - 페이지네이션(CTS)으로 여러 번 호출
+        - 최소 60개 영업일 데이터 수집 보장
+        - 진행 상황 실시간 출력
         """
         try:
             print(f"\n📊 일별 시세 데이터 조회 중 ({stock_code}, {days}일)...")
@@ -242,44 +314,45 @@ class KISClient:
                 "volumes": []
             }
             
-            # URL 설정 - 【중요】지수전용 API
-            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-index-daily-price"
+            # URL 설정
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
             
             headers = {
                 "authorization": f"Bearer {self.access_token}",
                 "appkey": self.api_key,
                 "appsecret": self.api_secret,
-                "tr_id": "FHPUP02120000",  # 【중요】국내업종 일자별지수
+                "tr_id": "FHKST03010100",
                 "custtype": "P"
             }
             
-            # 【Step 1】날짜 범위 설정
+            # 【Step 1】첫 번째 요청 (범위 기반)
             end_date = datetime.now().strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y%m%d")
-            
-            start = datetime.strptime(start_date, "%Y%m%d")
-            end = datetime.strptime(end_date, "%Y%m%d")
             
             print(f"   조회 기간: {start_date} ~ {end_date}")
             print(f"   ────────────────────────────────────")
             
-            # 【Step 2】역순 순회 (END_DATE부터 시작)
-            current_date = end
+            cts_time = ""  # 페이지네이션 토큰
             request_count = 0
             
-            while current_date >= start:
+            while True:
                 request_count += 1
-                date_string = current_date.strftime("%Y%m%d")
+                print(f"\n   【요청 #{request_count}】")
                 
-                print(f"\n   【요청 #{request_count}】{date_string} 기준")
-                
-                # 【중요】FID_INPUT_DATE_1만 사용 (기준 날짜)
                 params = {
-                    "FID_COND_MRKT_DIV_CODE": "U",      # U: 업종
-                    "FID_INPUT_ISCD": stock_code,
-                    "FID_PERIOD_DIV_CODE": "D",         # D: 일별
-                    "FID_INPUT_DATE_1": date_string     # 【중요】기준 날짜만
+                    "fid_cond_mrkt_div_code": "U",      # J: 일반주식 / U :업종 (지수)
+                    "fid_input_iscd": stock_code,
+                    "fid_input_date_1": start_date,
+                    "fid_input_date_2": end_date,
+                    "fid_period_div_code": "D",         # D: 일별
+                    "fid_org_adj_prc": "0"
                 }
+                
+                # CTS 토큰이 있으면 추가
+                if cts_time:
+                    params["fid_output"] = "1"
+                    params["cts_time"] = cts_time
+                    print(f"   📄 cts_time: {cts_time[:10]}... (페이지 계속)")
                 
                 # API 호출
                 response = requests.get(
@@ -310,67 +383,44 @@ class KISClient:
                     print(f"   ❌ API 오류: {msg}")
                     break
                 
-                # 【중요】output2에서 데이터 추출
+                # 데이터 추출
                 output_list = data.get('output2', [])
                 print(f"   📥 받은 데이터: {len(output_list)}개")
                 
                 if not output_list:
-                    print(f"   ℹ️  데이터 없음 (기준일 이전 거래 없음)")
-                    # 하루 이전으로 이동
-                    current_date -= timedelta(days=1)
-                    time.sleep(0.2)  # API 과도 호출 방지
-                    continue
+                    print(f"   ℹ️  데이터 없음 (요청 종료)")
+                    break
                 
                 # 데이터 추가
-                row_dates = []
                 for item in output_list:
-                    date_val = item.get('stck_bsop_date', '')
-                    
-                    all_data['dates'].append(date_val)
-                    all_data['opens'].append(float(item.get('bstp_nmix_oprc', 0)))
-                    all_data['highs'].append(float(item.get('bstp_nmix_hgpr', 0)))
-                    all_data['lows'].append(float(item.get('bstp_nmix_lwpr', 0)))
-                    all_data['closes'].append(float(item.get('bstp_nmix_prpr', 0)))
+                    all_data['dates'].append(item.get('stck_bsop_date', ''))
+                    all_data['opens'].append(float(item.get('stck_oprc', 0)))
+                    all_data['highs'].append(float(item.get('stck_hgpr', 0)))
+                    all_data['lows'].append(float(item.get('stck_lwpr', 0)))
+                    all_data['closes'].append(float(item.get('stck_clpr', 0)))
                     all_data['volumes'].append(int(item.get('acml_vol', 0)))
-                    
-                    if date_val:
-                        row_dates.append(date_val)
+                
+                # 【Step 2】CTS 토큰 확인 (페이지네이션)
+                output = data.get('output1', {})
+                cts_time = output.get('cts_time', '')
                 
                 print(f"   📊 누적: {len(all_data['dates'])}일 수집")
                 
-                # 【Step 3】가장 오래된 날짜 확인
-                if row_dates:
-                    # 문자열로 정렬 (YYYYMMDD 형식이므로 가능)
-                    oldest_date_str = min(row_dates)
-                    oldest_date = datetime.strptime(oldest_date_str, "%Y%m%d")
-                    
-                    print(f"   📅 이번 배치 가장 오래된 날: {oldest_date_str}")
-                    
-                    # 이미 시작일보다 오래된 데이터를 받았다면 종료
-                    if oldest_date <= start:
-                        print(f"   ✅ 목표({days}일) 도달! 종료")
-                        break
-                    
-                    # 다음 조회는 가장 오래된 날짜 이전부터
-                    current_date = oldest_date - timedelta(days=1)
-                else:
-                    # 데이터 없으면 하루 이전으로
-                    current_date -= timedelta(days=1)
-                
-                # API 과도 호출 방지
-                time.sleep(0.2)
-                
-                # 목표 개수 도달하면 종료
+                # 목표 개수 도달 또는 CTS 없으면 종료
                 if len(all_data['dates']) >= days:
                     print(f"   ✅ 목표({days}일) 도달! 종료")
                     break
                 
-                # 무한루프 방지 (최대 20번 요청)
-                if request_count >= 20:
-                    print(f"   ⚠️  최대 요청 횟수(20회) 도달")
+                if not cts_time or cts_time == '':
+                    print(f"   ℹ️  더 이상 데이터 없음 (CTS 없음, 종료)")
+                    break
+                
+                # 무한루프 방지 (최대 10번 요청)
+                if request_count >= 10:
+                    print(f"   ⚠️  최대 요청 횟수(10회) 도달")
                     break
             
-            # 【Step 4】최종 데이터 트리밍 (요청한 개수만)
+            # 【Step 3】최종 데이터 트리밍 (요청한 개수만)
             if len(all_data['dates']) > days:
                 all_data['dates'] = all_data['dates'][:days]
                 all_data['opens'] = all_data['opens'][:days]
@@ -387,7 +437,7 @@ class KISClient:
             print(f"   데이터: {len(all_data['dates'])}일")
             print(f"   요청 횟수: {request_count}회")
             
-            # 【Step 5】데이터 검증
+            # 【Step 4】데이터 검증
             if len(all_data['dates']) < days * 0.8:  # 80% 이상 수집 필수
                 print(f"   ⚠️  경고: 예상보다 적은 데이터 ({len(all_data['dates'])}/{days})")
                 print(f"   → 기술지표 계산이 정확하지 않을 수 있습니다")
@@ -477,7 +527,35 @@ class KISClient:
                 if not self.get_access_token():
                     return {}
             
-            return self.get_daily_price(stock_code, days)
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+            
+            headers = {
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.api_key,
+                "appsecret": self.api_secret,
+                "tr_id": "FHKST03010230",
+                "custtype": "P"
+            }
+            
+            params = {
+                "fid_cond_mrkt_div_code": "U",
+                "fid_input_iscd": stock_code,
+                "fid_period_div_code": "D"
+            }
+            
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                verify=False,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return self.get_daily_price(stock_code, days)
+            else:
+                print(f"❌ 일별 분봉 조회 실패: {response.status_code}")
+                return {}
                 
         except Exception as e:
             print(f"❌ 일별 분봉 조회 오류: {e}")

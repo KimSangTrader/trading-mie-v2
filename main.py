@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from market_intelligence.intelligence_manager import IntelligenceManager
 from market_intelligence.analyzers import (
     MarketAnalyzer,
@@ -9,6 +10,7 @@ from market_intelligence.analyzers import (
     TechnicalAnalyzer,
     ValuationAnalyzer
 )
+from data.kis_client import KISClient
 
 # 로깅 설정
 logging.basicConfig(
@@ -17,13 +19,156 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def get_real_market_data():
+    """KIS API에서 실시간 시장 데이터 조회"""
+    logger.info("\n【실시간 KIS API 데이터 조회 중...】")
+    
+    try:
+        # KIS 클라이언트 초기화
+        kis_client = KISClient()
+        
+        # 토큰 발급
+        if not kis_client.get_access_token():
+            logger.error("KIS API 토큰 발급 실패")
+            return None
+        
+        # 실시간 KOSPI/KOSDAQ 조회
+        real_data = kis_client.get_kospi_kosdaq()
+        
+        if not real_data:
+            logger.error("KIS API 데이터 조회 실패")
+            return None
+        
+        logger.info(f"✅ KOSPI (실제): {real_data.get('kospi_index', 0):.2f}")
+        logger.info(f"✅ KOSDAQ (실제): {real_data.get('kosdaq_index', 0):.2f}")
+        
+        return real_data
+        
+    except Exception as e:
+        logger.error(f"KIS API 조회 오류: {e}")
+        return None
+
+
+def merge_market_data(real_data):
+    """
+    KIS API 실제 데이터 + 모의 데이터 병합
+    
+    【실제 데이터】KOSPI, KOSDAQ, 거래량
+    【모의/계산 데이터】기술 지표, 뉴스 감정, 수급 상세
+    """
+    
+    if real_data is None:
+        logger.warning("실제 데이터 없음 - 완전 모의 데이터로 진행")
+        real_data = {}
+    
+    # 기본 마켓 데이터 (KIS 실제 데이터)
+    market_data = {
+        # ============ MarketAnalyzer (실제 데이터) ============
+        "kospi_index": real_data.get('kospi_index', 6258.77),
+        "kosdaq_index": real_data.get('kosdaq_index', 798.81),
+        "market_volume": real_data.get('market_volume', 1350000000),
+        
+        # ============ SectorAnalyzer (모의 데이터) ============
+        "IT_Semiconductor": 1425,
+        "Finance": 950,
+        "Chemicals_Energy": 650,
+        "Consumer": 800,
+        "Telecom_Media": 700,
+        "Healthcare_Pharma": 1200,
+        "Construction_Real_Estate": 550,
+        "Secondary_Battery": 900,
+        
+        # ============ MoneyFlowAnalyzer (모의 데이터) ============
+        "foreign": -8590000000,
+        "institutional": 5791000000,
+        "retail": 2500000000,
+        "program": 500000000,
+        
+        # ============ ThemeAnalyzer (모의 데이터) ============
+        "geopolitical_risk": 35,
+        "ai_semiconductor": 42,
+        "esg_battery": 62,
+        "value_buying": 68,
+        "economic_recovery": 48,
+        "tech_innovation": 65,
+        
+        # ============ NewsAnalyzer (모의 데이터) ============
+        "positive_news_count": 5,
+        "neutral_news_count": 7,
+        "negative_news_count": 6,
+        "total_news_count": 18,
+        "critical_disclosure_count": 0,
+        "important_disclosure_count": 1,
+        "minor_disclosure_count": 2,
+        "news_sentiment_score": 48.6,
+        
+        # ============ TechnicalAnalyzer (모의 데이터) ============
+        "macd_value": -15,
+        "rsi_value": 28,
+        "price": real_data.get('kospi_index', 6258.77),
+        "bb_upper": 6600,
+        "bb_middle": 6250,
+        "bb_lower": 5900,
+        "ma5": 6200,
+        "ma20": 6280,
+        "ma60": 6350,
+        
+        # ============ ValuationAnalyzer (모의 데이터) ============
+        "per_value": 12.0,
+        "per_average": 15.0,
+        "pbr_value": 1.0,
+        "pbr_average": 1.2,
+        "growth_rate": 4.0,
+        "growth_average": 5.0,
+        "dividend_yield": 3.5,
+        "dividend_average": 2.5
+    }
+    
+    return market_data
+
+
+def analyze_sentiment(score):
+    """점수에 따른 시장 심리 분석"""
+    if score >= 70:
+        return {
+            "mood": "🟢 강한 매수 신호",
+            "strategy": "적극적 매수",
+            "risk": "낮음"
+        }
+    elif score >= 60:
+        return {
+            "mood": "🟢 매수 신호",
+            "strategy": "점진적 매수",
+            "risk": "낮음~중간"
+        }
+    elif score >= 50:
+        return {
+            "mood": "🟡 중립",
+            "strategy": "관망 또는 분할 매수",
+            "risk": "중간"
+        }
+    elif score >= 40:
+        return {
+            "mood": "🔴 매도 신호",
+            "strategy": "점진적 매도",
+            "risk": "중간~높음"
+        }
+    else:
+        return {
+            "mood": "🔴 강한 매도 신호",
+            "strategy": "적극적 매도",
+            "risk": "높음"
+        }
+
+
 def main():
     """
-    MIE V2.0 최종 통합 테스트
-    7개 분석기가 완벽하게 작동하는지 검증
+    MIE V2.0 실시간 분석
+    KIS API 실제 데이터 + 분석기 통합
     """
     logger.info("=" * 80)
-    logger.info("🎊 MIE V2.0 최종 통합 테스트 시작!")
+    logger.info("🎊 MIE V2.0 - 실시간 KIS API 분석 시작!")
     logger.info("=" * 80)
     
     # 1. IntelligenceManager 초기화
@@ -42,78 +187,26 @@ def main():
         TechnicalAnalyzer(),
         ValuationAnalyzer()
     ]
-    
+   
     for analyzer in analyzers:
         manager.register_analyzer(analyzer)
         logger.info(f"✅ {analyzer.name} 등록 완료 (weight={analyzer.weight})")
     
     logger.info(f"✅ 총 {len(analyzers)}개 분석기 등록 완료")
     
-    # 3. 실제 시장 데이터 (2026-08-07 기준)
-    logger.info("\n【Step 3】실제 시장 데이터 준비 중...")
-    market_data = {
-        # ============ MarketAnalyzer ============
-        "kospi_index": 6258.77,          # KOSPI 현재값
-        "kosdaq_index": 798.81,          # KOSDAQ 현재값
-        "market_volume": 1350000000,     # 시장 거래량 (1,350억)
-        
-        # ============ SectorAnalyzer ============
-        "IT_Semiconductor": 1425,        # IT/반도체: -5% 약세
-        "Finance": 950,                  # 금융: 평상시
-        "Chemicals_Energy": 650,         # 화학/에너지: 약세
-        "Consumer": 800,                 # 소비재: 약세
-        "Telecom_Media": 700,            # 통신/미디어: 약세
-        "Healthcare_Pharma": 1200,       # 의료/제약: 평상시
-        "Construction_Real_Estate": 550, # 건설/부동산: 약세
-        "Secondary_Battery": 900,        # 2차전지: 중간
-        
-        # ============ MoneyFlowAnalyzer ============
-        "foreign": -8590000000,          # 외국인: -8,590억 순매도
-        "institutional": 5791000000,     # 기관: +5,791억 순매수
-        "retail": 2500000000,            # 개인: +2,500억 순매수 (추정)
-        "program": 500000000,            # 프로그램: +500억 (추정)
-        
-        # ============ ThemeAnalyzer ============
-        "geopolitical_risk": 35,         # 지정학적 리스크: 약세
-        "ai_semiconductor": 42,          # AI/반도체: 약세~중립
-        "esg_battery": 62,               # ESG/2차전지: 강세
-        "value_buying": 68,              # 저가 매수: 강세
-        "economic_recovery": 48,         # 경기 회복: 약세~중립
-        "tech_innovation": 65,           # 기술 혁신: 강세
-        
-        # ============ NewsAnalyzer ============
-        "positive_news_count": 5,        # 긍정: ESG, 저가 매수
-        "neutral_news_count": 7,         # 중립: 공시, 기술
-        "negative_news_count": 6,        # 부정: 중동 긴장, 반도체 약세
-        "total_news_count": 18,          # 총 뉴스
-        "critical_disclosure_count": 0,  # 중요 공시: 없음
-        "important_disclosure_count": 1, # 일반 공시: 1개
-        "minor_disclosure_count": 2,     # 경미 공시: 2개
-        "news_sentiment_score": 48.6,    # ← 추가! (긍정75 + 중립50 + 부정25의 가중 평균)
-        
-        # ============ TechnicalAnalyzer ============
-        "macd_value": -15,               # MACD: -15 (약세)
-        "rsi_value": 28,                 # RSI: 28 (과매도)
-        "price": 6258.77,                # 현재 가격
-        "bb_upper": 6600,                # 볼린저 밴드 상단
-        "bb_middle": 6250,               # 볼린저 밴드 중간
-        "bb_lower": 5900,                # 볼린저 밴드 하단
-        "ma5": 6200,                     # 5일 이동평균
-        "ma20": 6280,                    # 20일 이동평균
-        "ma60": 6350,                    # 60일 이동평균 (5MA<20MA<60MA=약세)
-        
-        # ============ ValuationAnalyzer ============
-        "per_value": 12.0,               # PER: 12배 (시장 평균 15 < 저평가)
-        "per_average": 15.0,             # PER 시장 평균
-        "pbr_value": 1.0,                # PBR: 1.0배 (저평가~평가)
-        "pbr_average": 1.2,              # PBR 시장 평균
-        "growth_rate": 4.0,              # 성장률: 4% (저성장)
-        "growth_average": 5.0,           # 성장률 평균
-        "dividend_yield": 3.5,           # 배당률: 3.5% (양호)
-        "dividend_average": 2.5          # 배당률 평균
-    }
+    # 3. 실시간 KIS API 데이터 조회 + 병합
+    logger.info("\n【Step 3】실시간 시장 데이터 준비 중...")
     
-    logger.info("✅ 시장 데이터 준비 완료 (39개 지표)")
+    # KIS API에서 실제 데이터 조회
+    real_data = get_real_market_data()
+    
+    # 실제 데이터 + 모의 데이터 병합
+    market_data = merge_market_data(real_data)
+    
+    if real_data:
+        logger.info("✅ 실제 시장 데이터 + 분석 데이터 준비 완료")
+    else:
+        logger.warning("⚠️  모의 데이터로 진행 (실제 데이터 조회 실패)")
     
     # 4. 분석 실행
     logger.info("\n【Step 4】7개 분석기 동시 분석 실행 중...")
@@ -168,7 +261,7 @@ def main():
     
     logger.info("-" * 80)
     
-# 5. 결과 분석 및 출력
+    # 5. 결과 분석 및 출력
     logger.info("\n【Step 5】분석 결과 상세 분석 중...")
     logger.info("=" * 80)
     
@@ -239,84 +332,16 @@ def main():
         logger.info("  배당률: 3.5% (양호한 수익성)")
         logger.info("  평가: 저평가 (매수 신호)")
         
+        logger.info("\n" + "=" * 80)
+        logger.info("✅ 분석 완료")
+        logger.info("=" * 80)
+        
+        return True
     else:
-        logger.error("❌ 분석 실패!")
-        logger.error(results.get("error", "알 수 없는 오류"))
-        # 실패해도 Step 6은 진행 (final_score는 0으로 초기화됨)
-    
-    # 6. 최종 검증
-    logger.info("\n【Step 6】최종 검증 중...")
-    logger.info("-" * 80)
-    
-    # 가중치 합 검증 (individual_scores가 있을 때만)
-    if individual_scores:
-        total_weight = sum(
-            score_data.get("weight", 0) 
-            for score_data in individual_scores.values() 
-            if isinstance(score_data, dict)
-        )
-        logger.info(f"✅ 가중치 합 검증: {total_weight:.2f} (1.00이어야 함)")
-    else:
-        logger.warning("⚠️ 분석 실패로 가중치 검증 불가")
-    
-    # 점수 범위 검증
-    if 0 <= final_score <= 100:
-        logger.info(f"✅ 최종 점수 범위 검증: {final_score:.2f} (0~100 범위 내)")
-    else:
-        logger.error(f"❌ 점수 범위 오류: {final_score}")
-    
-    logger.info("-" * 80)
-    
-    # 7. 완료 메시지
-    logger.info("\n" + "=" * 80)
-    logger.info("🎊 MIE V2.0 최종 통합 테스트 완료!")
-    logger.info("=" * 80)
-    logger.info(f"최종 점수: {final_score:.2f}/100")
-    
-    if results.get("success"):
-        logger.info("✅ 모든 분석기 정상 작동")
-        logger.info("✅ 7개 분석기 100% 완성")
-        logger.info("✅ PHASE 3 공식 완료! 🎉")
-    else:
-        logger.error("❌ 분석 과정에서 오류 발생")
-        logger.error(f"   원인: {results.get('error', '알 수 없음')}")
-    
-    logger.info("=" * 80)
-    
-    return results
+        logger.error("❌ 분석 결과 없음")
+        return False
 
-def analyze_sentiment(score: float) -> dict:
-    """최종 점수 기반 시장 심리 분석"""
-    if score >= 70:
-        return {
-            "mood": "매우 긍정적 (강한 상승 신호)",
-            "strategy": "공격적 매수",
-            "risk": "낮음 (안전)"
-        }
-    elif score >= 55:
-        return {
-            "mood": "긍정적 (약한 상승 신호)",
-            "strategy": "선택적 매수",
-            "risk": "낮음"
-        }
-    elif score >= 45:
-        return {
-            "mood": "중립 (혼합 신호)",
-            "strategy": "관망 또는 분할 매수",
-            "risk": "중간"
-        }
-    elif score >= 30:
-        return {
-            "mood": "부정적 (약한 하락 신호)",
-            "strategy": "선택적 매도",
-            "risk": "높음"
-        }
-    else:
-        return {
-            "mood": "매우 부정적 (강한 하락 신호)",
-            "strategy": "적극적 매도",
-            "risk": "매우 높음 (위험)"
-        }
 
 if __name__ == "__main__":
-    results = main()
+    success = main()
+    exit(0 if success else 1)
