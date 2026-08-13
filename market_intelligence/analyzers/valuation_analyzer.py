@@ -1,6 +1,12 @@
 ﻿"""
 ValuationAnalyzer - 기본분석 모듈 (Phase 4)
 PER, PBR, 배당수익률 등 기본분석 지표
+
+# valuation_analyzer.py 라인 28 수정
+# 【2026-08-13 수정】weight 0.25 → 0.09로 변경
+
+# 이전: super().__init__(name='valuation', weight=0.25)
+# 현재: super().__init__(name='valuation', weight=0.09)
 """
 
 import sys
@@ -19,7 +25,7 @@ class ValuationAnalyzer(BaseAnalyzer):
     """기본분석 모듈 - PER, PBR, 배당수익률 등"""
     
     def __init__(self):
-        super().__init__(name="valuation", weight=0.25)
+        super().__init__(name="valuation", weight=0.09)
         logger.info(f"✅ ValuationAnalyzer 초기화 완료 (weight={self.weight})")
     
     def validate(self, data: Dict[str, Any]) -> bool:

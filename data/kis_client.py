@@ -2,8 +2,34 @@
 KIS API 클라이언트 (환경별 자동 선택)
 한국투자증권 실시간 시장 데이터 조회
 【최종 수정】샘플 코드 방식 적용 - FHPUP02120000 (지수전용 API)
-"""
 
+================================================================================
+【변경 이력】
+================================================================================
+【2026-08-12】최초 생성
+- KIS API 클라이언트 초기화 및 토큰 관리
+- KOSPI/KOSDAQ 실시간 지수 조회
+- 일별 시세 데이터 (60일) 자동 수집
+- FHPUP02120000 API 사용 (지수전용)
+- 환경별 자동 선택 (production/development)
+
+【2026-08-13】데이터 정렬 로직 추가 + closes 순서 보장
+- 변경 사항:
+  * get_daily_price() 라인 373-390 수정
+  * API 응답 데이터를 그대로 저장하지 않고 날짜순 정렬
+  * 오래된 날짜부터 최신 날짜 순서로 정렬
+  * closes[-1]이 실제 최신 종가가 되도록 보장
+  * sorted_indices를 사용한 병렬 정렬 (dates, opens, highs, lows, closes, volumes)
+- 목적:
+  * 5일 데이터와 60일 데이터 불일치 문제 해결
+  * closes 리스트의 마지막 값이 현재가가 되도록 수정
+  * 기술지표 계산의 정확도 향상
+- 영향:
+  * 기존 기능 100% 유지
+  * 데이터 순서만 보장 추가
+  * TechnicalAnalyzer에서 closes[-1]이 현재가를 올바르게 반영
+================================================================================
+"""
 import requests
 import json
 import os
@@ -223,6 +249,10 @@ class KISClient:
         - FHPUP02120000 (국내업종 일자별지수 API) 사용
         - FID_INPUT_DATE_1 기준 날짜부터 과거 방향으로 ~100개 캔들 반환
         - END_DATE부터 시작해서 역순 순회
+        
+        【2026-08-13 수정】데이터 정렬 로직 추가
+        - API 응답을 그대로 사용하지 않고 날짜순 정렬
+        - closes[-1]이 최신 종가가 되도록 보장
         """
         try:
             print(f"\n📊 일별 시세 데이터 조회 중 ({stock_code}, {days}일)...")
@@ -379,6 +409,20 @@ class KISClient:
                 all_data['closes'] = all_data['closes'][:days]
                 all_data['volumes'] = all_data['volumes'][:days]
             
+            # 【2026-08-13 추가】날짜순으로 정렬 (오래된 순 → 최신 순)
+            # API 응답이 최신부터 오래된 순서이므로, 날짜를 기준으로 정렬하여
+            # closes[-1]이 실제 최신 종가가 되도록 보장
+            if len(all_data['dates']) > 0:
+                sorted_indices = sorted(range(len(all_data['dates'])), 
+                                       key=lambda i: all_data['dates'][i])
+                
+                all_data['dates'] = [all_data['dates'][i] for i in sorted_indices]
+                all_data['opens'] = [all_data['opens'][i] for i in sorted_indices]
+                all_data['highs'] = [all_data['highs'][i] for i in sorted_indices]
+                all_data['lows'] = [all_data['lows'][i] for i in sorted_indices]
+                all_data['closes'] = [all_data['closes'][i] for i in sorted_indices]
+                all_data['volumes'] = [all_data['volumes'][i] for i in sorted_indices]
+            
             print(f"\n   ────────────────────────────────────")
             print(f"✅ 최종 수집 완료!")
             print(f"   심볼: {stock_code}")
@@ -484,49 +528,49 @@ class KISClient:
             return {}
 
     def test_connection(self) -> bool:
-            """API 연결 테스트"""
-            try:
-                print("="*60)
-                print("KIS API 연결 테스트")
-                print("="*60)
-                
-                # Step 1: 토큰 발급
-                if not self.get_access_token():
-                    return False
-                
-                # Step 2: 데이터 조회
-                data = self.get_kospi_kosdaq()
-                
-                if data:
-                    print("\n" + "="*60)
-                    print("✅ KIS API 연결 성공!")
-                    print("="*60)
-                    print(f"환경: {self.environment}")
-                    print(f"\n【지수 정보】")
-                    
-                    if 'kospi_index' in data:
-                        print(f"KOSPI: {data['kospi_index']:.2f}")
-                        print(f"  전일 대비: {data.get('kospi_change', 0):+.2f}")
-                        print(f"  변화율: {data.get('kospi_change_rate', 0):+.2f}%")
-                        print(f"  거래량: {data.get('kospi_volume', 0):,}")
-                    
-                    if 'kosdaq_index' in data:
-                        print(f"\nKOSDAQ: {data['kosdaq_index']:.2f}")
-                        print(f"  전일 대비: {data.get('kosdaq_change', 0):+.2f}")
-                        print(f"  변화율: {data.get('kosdaq_change_rate', 0):+.2f}%")
-                        print(f"  거래량: {data.get('kosdaq_volume', 0):,}")
-                    
-                    print(f"\n마지막 업데이트: {self.last_update}")
-                    return True
-                else:
-                    print("\n❌ 데이터 조회 실패")
-                    return False
-                
-            except Exception as e:
-                print(f"❌ 테스트 실패: {e}")
-                import traceback
-                traceback.print_exc()
+        """API 연결 테스트"""
+        try:
+            print("="*60)
+            print("KIS API 연결 테스트")
+            print("="*60)
+            
+            # Step 1: 토큰 발급
+            if not self.get_access_token():
                 return False
+            
+            # Step 2: 데이터 조회
+            data = self.get_kospi_kosdaq()
+            
+            if data:
+                print("\n" + "="*60)
+                print("✅ KIS API 연결 성공!")
+                print("="*60)
+                print(f"환경: {self.environment}")
+                print(f"\n【지수 정보】")
+                
+                if 'kospi_index' in data:
+                    print(f"KOSPI: {data['kospi_index']:.2f}")
+                    print(f"  전일 대비: {data.get('kospi_change', 0):+.2f}")
+                    print(f"  변화율: {data.get('kospi_change_rate', 0):+.2f}%")
+                    print(f"  거래량: {data.get('kospi_volume', 0):,}")
+                
+                if 'kosdaq_index' in data:
+                    print(f"\nKOSDAQ: {data['kosdaq_index']:.2f}")
+                    print(f"  전일 대비: {data.get('kosdaq_change', 0):+.2f}")
+                    print(f"  변화율: {data.get('kosdaq_change_rate', 0):+.2f}%")
+                    print(f"  거래량: {data.get('kosdaq_volume', 0):,}")
+                
+                print(f"\n마지막 업데이트: {self.last_update}")
+                return True
+            else:
+                print("\n❌ 데이터 조회 실패")
+                return False
+            
+        except Exception as e:
+            print(f"❌ 테스트 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 if __name__ == "__main__":
     try:

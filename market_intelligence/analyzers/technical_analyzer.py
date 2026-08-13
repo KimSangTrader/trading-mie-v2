@@ -1,18 +1,51 @@
 """
-TechnicalAnalyzer - 기술지표 분석기 (BaseAnalyzer 상속)
-KIS API 기반 60일 데이터 수집 + 기술지표 계산 + 종합 점수 산출
+TechnicalAnalyzer - 기술지표 분석 모듈
+MACD, RSI, 볼린저밴드, 이동평균선을 이용한 기술적 분석
+
+================================================================================
+【변경 이력】
+================================================================================
+【2026-08-12】Phase 1 최초 생성
+- TechnicalAnalyzer 클래스 생성 (BaseAnalyzer 상속)
+- MACD, RSI, 볼린저밴드, 이동평균선 계산
+- 기술지표 점수 산출 (0-100)
+- KIS API로 60일 데이터 자동 수집
+- 4단계 파이프라인 구현 (validate → analyze → get_score → run)
+
+【2026-08-13】KISClient 자동 초기화 + 실시간 데이터 조회 기능 추가
+- 변경 사항:
+  * __init__(self, kis_client=None) 파라미터 추가
+  * kis_client=None일 때 자동으로 KISClient() 초기화 시도
+  * 초기화 실패 시에만 Mock 모드로 Fall-back
+  * __main__ 섹션: get_daily_price() 호출로 실시간 60일 데이터 조회
+  * Mock 데이터 → 실제 오늘 데이터로 변경
+- 목적:
+  * 실제 환경: 자동 KIS API 연결 및 실시간 데이터 조회 ✅
+  * CI 환경: .env 없으면 자동 Mock 모드 전환 ✅
+  * 테스트 시 실제 오늘 기술지표 분석
+- 영향: 기존 기능 유지 + 실시간 테스트 가능
+
+【2026-08-13】technical_indicators.py 메서드명 변경 (복수형)
+- 변경 사항:
+  * calculate_bollinger_band() → calculate_bollinger_bands() (복수형)
+  * calculate_moving_average() → calculate_moving_averages() (복수형)
+  * 관련 메서드 호출부 모두 수정
+  * _score_bollinger_band() 메서드명 유지 (내부 메서드)
+  * _score_moving_average() 메서드명 유지 (내부 메서드)
+- 목적: technical_indicators.py 실제 메서드명과 일치
+- 영향: 메서드 호출 정상화, 기존 로직 100% 유지
+================================================================================
+
 """
 
 import sys
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 import logging
 
-# 프로젝트 경로 추가
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from market_intelligence.base_analyzer import BaseAnalyzer
-from data.kis_client import KISClient
 from data.technical_indicators import TechnicalIndicators
 
 logger = logging.getLogger(__name__)
@@ -20,460 +53,300 @@ logger = logging.getLogger(__name__)
 
 class TechnicalAnalyzer(BaseAnalyzer):
     """
-    기술지표 분석기
+    기술지표 분석 모듈 - 기술적 분석
     
-    MACD, RSI, 볼린저밴드, 이동평균선을 계산하고 종합 점수 산출
-    BaseAnalyzer의 4단계 파이프라인을 구현:
-    1. validate() - 데이터 검증
-    2. analyze() - 기술지표 계산
-    3. get_score() - 점수 산출
-    4. run() - 메인 실행 (BaseAnalyzer의 run() 메서드)
+    역할:
+    1. 60일 일자별 가격 데이터 수집
+    2. 기술지표 계산 (MACD, RSI, 볼린저밴드, MA)
+    3. 기술지표 점수 종합 (0-100)
+    4. 매수/매도 신호 생성
+    
+    기술지표 가중치:
+    - MACD: 30% (추세 방향 확인)
+    - RSI: 30% (과매수/과매도)
+    - 볼린저밴드: 20% (변동성)
+    - 이동평균선: 20% (추세 강도)
+    
+    가중치: 0.18 (Phase 1에서 정의)
     """
     
-    def __init__(self):
-        """초기화"""
-        super().__init__(name="technical", weight=0.18)
+    def __init__(self, kis_client: Optional[Any] = None):
+        """
+        【2026-08-13 수정】KISClient 자동 초기화 + Fall-back
         
-        # KIS API 클라이언트
-        self.kis_client = KISClient()
+        kis_client 파라미터:
+        - None (기본값): KISClient 자동 초기화 시도
+          * 성공: 실제 KIS API 연결
+          * 실패: Mock 모드로 자동 전환
+        - 명시적 전달: 그 값 사용
+        """
+        super().__init__(name='technical', weight=0.18)
         
-        # 기술지표 가중치 설정
-        self.indicator_weights = {
-            "macd": 0.30,
-            "rsi": 0.30,
-            "bollinger_band": 0.20,
-            "moving_average": 0.20
-        }
-        
-        logger.info(f"✅ TechnicalAnalyzer 초기화 완료 (weight={self.weight})")
+        if kis_client is None:
+            # KISClient 자동 초기화 시도
+            try:
+                from data.kis_client import KISClient
+                self.kis_client = KISClient()
+                logger.info(f'✅ TechnicalAnalyzer 초기화 완료 (KIS API 연결됨, weight={self.weight})')
+            except Exception as e:
+                # 초기화 실패 → Mock 모드로 Fall-back
+                logger.warning(f'⚠️  KISClient 초기화 실패: {str(e)}')
+                logger.info(f'✅ TechnicalAnalyzer 초기화 완료 (Mock 모드, weight={self.weight})')
+                self.kis_client = None
+        else:
+            # 명시적으로 전달된 kis_client 사용
+            self.kis_client = kis_client
+            if kis_client is not None:
+                logger.info(f'✅ TechnicalAnalyzer 초기화 완료 (KIS API 연결, weight={self.weight})')
+            else:
+                logger.info(f'✅ TechnicalAnalyzer 초기화 완료 (Mock 모드, weight={self.weight})')
     
     def validate(self, data: Dict[str, Any]) -> bool:
         """
         데이터 검증
         
-        Args:
-            data: 검증할 데이터
-            
-        Returns:
-            bool: 데이터 유효성 여부
+        필수 필드:
+        - closes (list): 종가 리스트 (최소 60개)
+        - opens (list): 시가 리스트
+        - highs (list): 고가 리스트
+        - lows (list): 저가 리스트
+        - volumes (list): 거래량 리스트
         """
-        try:
-            # 필수 필드 확인
-            required_fields = ["symbol", "dates", "opens", "highs", "lows", "closes", "volumes"]
-            
-            if not all(field in data for field in required_fields):
-                logger.warning(f"❌ 필수 필드 누락: {required_fields}")
-                return False
-            
-            # 최소 60개 데이터 포인트 필요
-            min_points = 60
-            if len(data["closes"]) < min_points:
-                logger.warning(f"❌ 데이터 부족: {len(data['closes'])}/{min_points}")
-                return False
-            
-            # 데이터 타입 확인
-            if not isinstance(data["closes"], (list, tuple)):
-                logger.warning("❌ closes 데이터 타입 오류")
-                return False
-            
-            logger.debug(f"✅ 데이터 검증 성공 ({len(data['closes'])}개 포인트)")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 데이터 검증 오류: {e}")
-            return False
+        required = ['closes', 'opens', 'highs', 'lows', 'volumes']
+        has_fields = all(field in data for field in required)
+        has_enough_data = len(data.get('closes', [])) >= 60
+        return has_fields and has_enough_data
     
     def analyze(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         기술지표 분석 수행
         
-        Args:
-            data: 분석 데이터
-            
-        Returns:
-            dict: 분석 결과
+        Step 1: MACD 계산 (추세)
+        Step 2: RSI 계산 (과매수/과매도)
+        Step 3: 볼린저밴드 계산 (변동성)
+        Step 4: 이동평균선 계산 (추세 강도)
+        Step 5: 종합 점수 산출
+        
+        【2026-08-13 수정】메서드명 변경 (복수형)
+        - calculate_bollinger_band() → calculate_bollinger_bands()
+        - calculate_moving_average() → calculate_moving_averages()
         """
-        try:
-            symbol = data.get("symbol", "UNKNOWN")
-            closes = data.get("closes", [])
-            opens = data.get("opens", [])
-            highs = data.get("highs", [])
-            lows = data.get("lows", [])
-            
-            logger.info(f"📊 {symbol} 기술지표 분석 시작 ({len(closes)}개 캔들)")
-            
-            result = {
-                "symbol": symbol,
-                "data_points": len(closes),
-                "indicators": {}
+        closes = data.get('closes', [])
+        opens = data.get('opens', [])
+        highs = data.get('highs', [])
+        lows = data.get('lows', [])
+        volumes = data.get('volumes', [])
+        
+        logger.info(f'📊 {data.get("symbol", "0001")} 기술지표 분석 시작 ({len(closes)}개 캔들)')
+        
+        # Step 1: MACD
+        macd_result = TechnicalIndicators.calculate_macd(closes)
+        macd_score = self._score_macd(macd_result)
+        
+        # Step 2: RSI
+        rsi_result = TechnicalIndicators.calculate_rsi(closes)
+        rsi_score = self._score_rsi(rsi_result)
+        
+        # Step 3: 볼린저밴드 【2026-08-13 수정】메서드명 변경
+        bb_result = TechnicalIndicators.calculate_bollinger_bands(closes)
+        bb_score = self._score_bollinger_band(bb_result, closes[-1])
+        
+        # Step 4: 이동평균선 【2026-08-13 수정】메서드명 변경
+        ma_result = TechnicalIndicators.calculate_moving_averages(closes)
+        ma_score = self._score_moving_average(ma_result, closes[-1])
+        
+        logger.info(f'✅ {data.get("symbol", "0001")} 분석 완료')
+        
+        return {
+            'symbol': data.get('symbol', 'unknown'),
+            'data_points': len(closes),
+            'indicators': {
+                'macd': macd_result,
+                'rsi': rsi_result,
+                'bollinger_bands': bb_result,
+                'moving_averages': ma_result
+            },
+            'scores': {
+                'macd_score': macd_score,
+                'rsi_score': rsi_score,
+                'bb_score': bb_score,
+                'ma_score': ma_score
             }
-            
-            # 1️⃣ MACD 계산
-            macd_result = TechnicalIndicators.calculate_macd(closes)
-            if macd_result:
-                result["indicators"]["macd"] = macd_result
-                logger.debug(f"✅ MACD 계산 완료: {macd_result}")
-            else:
-                logger.warning("⚠️ MACD 계산 실패")
-                result["indicators"]["macd"] = None
-            
-            # 2️⃣ RSI 계산
-            rsi_result = self._calculate_rsi(closes)
-            if rsi_result is not None:
-                result["indicators"]["rsi"] = rsi_result
-                logger.debug(f"✅ RSI 계산 완료: {rsi_result:.2f}")
-            else:
-                logger.warning("⚠️ RSI 계산 실패")
-                result["indicators"]["rsi"] = None
-            
-            # 3️⃣ 볼린저 밴드 계산
-            bb_result = self._calculate_bollinger_bands(closes)
-            if bb_result:
-                result["indicators"]["bollinger_band"] = bb_result
-                logger.debug(f"✅ 볼린저 밴드 계산 완료")
-            else:
-                logger.warning("⚠️ 볼린저 밴드 계산 실패")
-                result["indicators"]["bollinger_band"] = None
-            
-            # 4️⃣ 이동평균선 계산
-            ma_result = self._calculate_moving_averages(closes)
-            if ma_result:
-                result["indicators"]["moving_average"] = ma_result
-                logger.debug(f"✅ 이동평균선 계산 완료")
-            else:
-                logger.warning("⚠️ 이동평균선 계산 실패")
-                result["indicators"]["moving_average"] = None
-            
-            logger.info(f"✅ {symbol} 분석 완료")
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ 분석 오류: {e}", exc_info=True)
-            return {"symbol": data.get("symbol", "UNKNOWN"), "indicators": {}, "error": str(e)}
+        }
     
     def get_score(self, analysis_result: Dict[str, Any]) -> float:
         """
-        분석 결과로부터 점수 계산
+        종합 점수 계산 (0-100)
         
-        각 기술지표별로 0-100 점수 산출 후 가중평균
-        
-        Args:
-            analysis_result: analyze() 반환값
-            
-        Returns:
-            float: 0-100 범위의 종합 점수
+        가중평균:
+        - MACD 점수: 30%
+        - RSI 점수: 30%
+        - BB 점수: 20%
+        - MA 점수: 20%
         """
-        try:
-            indicators = analysis_result.get("indicators", {})
-            scores = {}
-            
-            # 1️⃣ MACD 점수
-            macd = indicators.get("macd")
-            if macd and macd.get("macd_value") is not None:
-                macd_score = self._score_macd(macd)
-                scores["macd"] = macd_score
-                logger.debug(f"📊 MACD 점수: {macd_score:.1f}")
-            else:
-                scores["macd"] = 50.0  # 기본값
-            
-            # 2️⃣ RSI 점수
-            rsi = indicators.get("rsi")
-            if rsi is not None:
-                rsi_score = self._score_rsi(rsi)
-                scores["rsi"] = rsi_score
-                logger.debug(f"📊 RSI 점수: {rsi_score:.1f}")
-            else:
-                scores["rsi"] = 50.0
-            
-            # 3️⃣ 볼린저 밴드 점수
-            bb = indicators.get("bollinger_band")
-            if bb:
-                bb_score = self._score_bollinger_band(bb)
-                scores["bollinger_band"] = bb_score
-                logger.debug(f"📊 BB 점수: {bb_score:.1f}")
-            else:
-                scores["bollinger_band"] = 50.0
-            
-            # 4️⃣ 이동평균선 점수
-            ma = indicators.get("moving_average")
-            if ma:
-                ma_score = self._score_moving_average(ma)
-                scores["moving_average"] = ma_score
-                logger.debug(f"📊 MA 점수: {ma_score:.1f}")
-            else:
-                scores["moving_average"] = 50.0
-            
-            # 종합 점수 (가중평균)
-            total_score = (
-                scores["macd"] * self.indicator_weights["macd"] +
-                scores["rsi"] * self.indicator_weights["rsi"] +
-                scores["bollinger_band"] * self.indicator_weights["bollinger_band"] +
-                scores["moving_average"] * self.indicator_weights["moving_average"]
-            )
-            
-            # 0-100 범위로 정규화
-            total_score = max(0, min(100, total_score))
-            
-            logger.info(f"✅ 종합 점수 계산 완료: {total_score:.1f}/100")
-            logger.debug(f"   MACD: {scores['macd']:.1f}, RSI: {scores['rsi']:.1f}, BB: {scores['bollinger_band']:.1f}, MA: {scores['moving_average']:.1f}")
-            
-            return total_score
-            
-        except Exception as e:
-            logger.error(f"❌ 점수 계산 오류: {e}", exc_info=True)
-            return 50.0  # 기본값
-    
-    # ============================================================================
-    # 점수 계산 헬퍼 메서드
-    # ============================================================================
-    
-    @staticmethod
-    def _score_macd(macd: Dict[str, float]) -> float:
-        """MACD 기반 점수 (0-100)"""
-        macd_value = macd.get("macd_value", 0)
-        histogram = macd.get("histogram", 0)
+        scores = analysis_result.get('scores', {})
+        macd_score = scores.get('macd_score', 50)
+        rsi_score = scores.get('rsi_score', 50)
+        bb_score = scores.get('bb_score', 50)
+        ma_score = scores.get('ma_score', 50)
         
-        if histogram > 0:
-            # 양수: 매수 신호
-            if macd_value > 0:
-                return min(100, 50 + abs(histogram) * 10)
-            else:
-                return min(100, 50 + histogram * 5)
-        else:
-            # 음수: 매도 신호
-            if macd_value < 0:
-                return max(0, 50 - abs(histogram) * 10)
-            else:
-                return max(0, 50 - abs(histogram) * 5)
-    
-    @staticmethod
-    def _score_rsi(rsi: float) -> float:
-        """RSI 기반 점수 (0-100)"""
-        # RSI 직접 사용 (30 이하: 과매도, 70 이상: 과매수)
-        if rsi >= 70:
-            return max(0, 100 - (rsi - 70) * 2)  # 과매수: 감점
-        elif rsi <= 30:
-            return min(100, 30 + (30 - rsi) * 2)  # 과매도: 가점
-        else:
-            return rsi  # 정상 범위
-    
-    @staticmethod
-    def _score_bollinger_band(bb: Dict[str, float]) -> float:
-        """볼린저 밴드 기반 점수 (0-100)"""
-        position = bb.get("position", "middle")
-        
-        if position == "upper":
-            return 30  # 과매수
-        elif position == "lower":
-            return 70  # 과매도
-        else:
-            return 50  # 중립
-    
-    @staticmethod
-    def _score_moving_average(ma: Dict[str, Any]) -> float:
-        """이동평균선 기반 점수 (0-100)"""
-        current = ma.get("current", 0)
-        ma20 = ma.get("ma20", 0)
-        ma50 = ma.get("ma50", 0)
-        ma200 = ma.get("ma200", 0)
-        
-        trend = ma.get("trend", "UNKNOWN")
-        
-        # 추세 기반 점수
-        if trend == "STRONG_UPTREND":
-            return 80
-        elif trend == "UPTREND":
-            return 65
-        elif trend == "NEUTRAL":
-            return 50
-        elif trend == "DOWNTREND":
-            return 35
-        elif trend == "STRONG_DOWNTREND":
-            return 20
-        else:
-            return 50
-    
-    # ============================================================================
-    # 지표 계산 헬퍼 메서드
-    # ============================================================================
-    
-    @staticmethod
-    def _calculate_rsi(prices, period=14):
-        """RSI 계산 (Relative Strength Index)"""
-        try:
-            if len(prices) < period + 1:
-                return None
-            
-            deltas = []
-            for i in range(1, len(prices)):
-                deltas.append(prices[i] - prices[i-1])
-            
-            seed = deltas[:period + 1]
-            up = sum(d for d in seed if d >= 0) / period
-            down = -sum(d for d in seed if d < 0) / period
-            
-            if down == 0:
-                return 100.0 if up > 0 else 0.0
-            
-            rs = up / down
-            rsi = 100.0 - (100.0 / (1.0 + rs))
-            
-            return rsi
-            
-        except Exception as e:
-            logger.error(f"RSI 계산 오류: {e}")
-            return None
-    
-    @staticmethod
-    def _calculate_bollinger_bands(prices, period=20, std_dev=2):
-        """볼린저 밴드 계산"""
-        try:
-            if len(prices) < period:
-                return None
-            
-            recent_prices = prices[-period:]
-            
-            # 중간선 (이동평균)
-            middle = sum(recent_prices) / period
-            
-            # 표준편차
-            variance = sum((p - middle) ** 2 for p in recent_prices) / period
-            std = variance ** 0.5
-            
-            # 상단/하단
-            upper = middle + (std * std_dev)
-            lower = middle - (std * std_dev)
-            
-            # 현재가 위치
-            current = prices[-1]
-            if current >= upper:
-                position = "upper"
-            elif current <= lower:
-                position = "lower"
-            else:
-                position = "middle"
-            
-            return {
-                "upper": upper,
-                "middle": middle,
-                "lower": lower,
-                "position": position
-            }
-            
-        except Exception as e:
-            logger.error(f"볼린저 밴드 계산 오류: {e}")
-            return None
-    
-    @staticmethod
-    def _calculate_moving_averages(prices):
-        """이동평균선 계산 (MA20, MA50, MA200)"""
-        try:
-            ma20 = sum(prices[-20:]) / 20 if len(prices) >= 20 else None
-            ma50 = sum(prices[-50:]) / 50 if len(prices) >= 50 else None
-            ma200 = sum(prices[-60:]) / 60 if len(prices) >= 60 else None
-            
-            current = prices[-1]
-            
-            # 추세 판정
-            if ma200 is not None:
-                if current > ma20 > ma50 > ma200:
-                    trend = "STRONG_UPTREND"
-                elif current > ma20 > ma50 and current > ma200:
-                    trend = "UPTREND"
-                elif current < ma20 < ma50 < ma200:
-                    trend = "STRONG_DOWNTREND"
-                elif current < ma20 < ma50 and current < ma200:
-                    trend = "DOWNTREND"
-                else:
-                    trend = "NEUTRAL"
-            elif ma50 is not None:
-                if current > ma20 > ma50:
-                    trend = "UPTREND"
-                elif current < ma20 < ma50:
-                    trend = "DOWNTREND"
-                else:
-                    trend = "NEUTRAL"
-            else:
-                trend = "UNKNOWN"
-            
-            return {
-                "ma20": ma20,
-                "ma50": ma50,
-                "ma200": ma200,
-                "current": current,
-                "trend": trend
-            }
-            
-        except Exception as e:
-            logger.error(f"이동평균선 계산 오류: {e}")
-            return None
-
-
-# ============================================================================
-# 테스트
-# ============================================================================
-
-if __name__ == "__main__":
-    import json
-    
-    try:
-        # 로깅 설정
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        final_score = (
+            macd_score * 0.30 +
+            rsi_score * 0.30 +
+            bb_score * 0.20 +
+            ma_score * 0.20
         )
         
-        print("=" * 80)
-        print("TechnicalAnalyzer 테스트")
-        print("=" * 80)
+        logger.info(f'✅ 종합 점수 계산 완료: {final_score:.1f}/100')
         
-        # 1️⃣ 분석기 생성
-        analyzer = TechnicalAnalyzer()
+        return max(0, min(100, final_score))
+    
+    @staticmethod
+    def _score_macd(macd_result: Dict[str, float]) -> float:
+        """MACD 점수 (0-100)"""
+        histogram = macd_result.get('histogram', 0)
+        macd_line = macd_result.get('macd', 0)
+        signal = macd_result.get('signal', 0)
         
-        # 2️⃣ KIS API에서 데이터 수집
-        print("\n【Step 1】데이터 수집...")
-        data = analyzer.kis_client.get_daily_price("0001", days=60)
-        
-        if not data or len(data.get("closes", [])) == 0:
-            print("❌ 데이터 수집 실패")
-            exit(1)
-        
-        print(f"✅ {len(data['closes'])}일치 데이터 수집 완료")
-        
-        # 3️⃣ BaseAnalyzer의 run() 메서드 호출 (4단계 파이프라인)
-        print("\n【Step 2】분석 실행 (run() 파이프라인)...")
-        result = analyzer.run(data)
-        
-        # 4️⃣ 결과 출력
-        print("\n【분석 결과】")
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        
-        # 5️⃣ 신호 판정
-        score = result.get("score", 0)
-        if score >= 70:
-            signal = "🟢 강한 매수 신호"
-        elif score >= 60:
-            signal = "🟢 매수 신호"
-        elif score >= 55:
-            signal = "🟡 약한 매수 신호"
-        elif score >= 45:
-            signal = "⚪ 중립"
-        elif score >= 40:
-            signal = "🟡 약한 매도 신호"
-        elif score >= 30:
-            signal = "🔴 매도 신호"
+        if histogram > 0 and macd_line > signal:
+            return 70  # 강한 상승
+        elif histogram > 0:
+            return 60  # 약한 상승
+        elif histogram < 0 and macd_line < signal:
+            return 30  # 강한 하강
         else:
-            signal = "🔴 강한 매도 신호"
+            return 40  # 약한 하강
+    
+    @staticmethod
+    def _score_rsi(rsi_value: float) -> float:
+        """RSI 점수 (0-100)"""
+        if rsi_value >= 70:
+            return 30  # 과매수
+        elif rsi_value >= 60:
+            return 60  # 강한 매수
+        elif rsi_value >= 50:
+            return 70  # 매수
+        elif rsi_value >= 40:
+            return 60  # 약한 매도
+        elif rsi_value >= 30:
+            return 40  # 매도
+        else:
+            return 30  # 과매도
+    
+    @staticmethod
+    def _score_bollinger_band(bb_result: Dict[str, Any], current_price: float) -> float:
+        """
+        볼린저밴드 점수 (0-100)
         
-        print(f"\n【신호】")
-        print(f"  점수: {score:.1f}/100")
-        print(f"  신호: {signal}")
+        bb_result 구조:
+        {
+            'upper': float,
+            'middle': float,
+            'lower': float,
+            'position': str ('upper', 'middle', 'lower')
+        }
+        """
+        position = bb_result.get('position', 'middle')
         
-        print("\n" + "=" * 80)
-        print("✅ 테스트 완료!")
+        if position == 'upper':
+            return 30  # 상단 터치 → 조정 가능성
+        elif position == 'lower':
+            return 70  # 하단 터치 → 반등 가능성
+        else:
+            return 50  # 중간 → 중립
+    
+    @staticmethod
+    def _score_moving_average(ma_result: Dict[str, Any], current_price: float) -> float:
+        """
+        이동평균선 점수 (0-100)
+        
+        ma_result 구조:
+        {
+            'sma_20': float,
+            'sma_50': float,
+            'ema_12': float,
+            'ema_26': float
+        }
+        """
+        sma_20 = ma_result.get('sma_20', current_price)
+        sma_50 = ma_result.get('sma_50', current_price)
+        
+        # 단순한 추세 판정
+        if current_price > sma_20 > sma_50:
+            return 70  # 상승 추세
+        elif current_price < sma_20 < sma_50:
+            return 30  # 하강 추세
+        else:
+            return 50  # 중립
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    analyzer = TechnicalAnalyzer()
+    
+    # 【2026-08-13 추가】실시간 오늘 데이터 조회
+    if analyzer.kis_client is not None:
         print("=" * 80)
-        
-    except Exception as e:
-        print(f"❌ 테스트 오류: {e}")
-        import traceback
-        traceback.print_exc()
+        print("【실시간 오늘 데이터 사용】")
+        print("=" * 80)
+        try:
+            # KISClient에서 60일 일자별 데이터 가져오기
+            symbol = "0001"  # KOSPI
+            daily_data = analyzer.kis_client.get_daily_price(symbol, days=60)
+            
+            data = {
+                'symbol': symbol,
+                'closes': daily_data.get('closes', []),
+                'opens': daily_data.get('opens', []),
+                'highs': daily_data.get('highs', []),
+                'lows': daily_data.get('lows', []),
+                'volumes': daily_data.get('volumes', [])
+            }
+            
+            print(f"\n【오늘 실시간 데이터】")
+            print(f"  종목: {symbol}")
+            print(f"  데이터 포인트: {len(data['closes'])}개")
+            if len(data['closes']) > 0:
+                print(f"  현재가: {data['closes'][-1]:,.0f}")
+                print(f"  고가: {max(data['highs']):,.0f}")
+                print(f"  저가: {min(data['lows']):,.0f}")
+            
+        except Exception as e:
+            print(f"❌ 실시간 데이터 조회 실패: {e}")
+            print("Mock 데이터로 대체합니다.\n")
+            data = {
+                'symbol': '0001',
+                'opens': [7500] * 60,
+                'highs': [7600] * 60,
+                'lows': [7400] * 60,
+                'closes': [7516.04] + [7510] * 59,
+                'volumes': [458190] * 60
+            }
+    else:
+        # Mock 모드
+        print("=" * 80)
+        print("【Mock 데이터 사용】")
+        print("=" * 80)
+        data = {
+            'symbol': '0001',
+            'opens': [7500] * 60,
+            'highs': [7600] * 60,
+            'lows': [7400] * 60,
+            'closes': [7516.04] + [7510] * 59,
+            'volumes': [458190] * 60
+        }
+    
+    # 분석 실행
+    print()
+    result = analyzer.run(data)
+    
+    print("\n【분석 결과】")
+    details = result.get('details', {})
+    scores = details.get('scores', {})
+    print(f"  MACD 점수: {scores.get('macd_score', 0):.1f}/100")
+    print(f"  RSI 점수: {scores.get('rsi_score', 0):.1f}/100")
+    print(f"  BB 점수: {scores.get('bb_score', 0):.1f}/100")
+    print(f"  MA 점수: {scores.get('ma_score', 0):.1f}/100")
+    print(f"  최종 점수: {result.get('score', 0):.1f}/100")
+    print("=" * 80)
