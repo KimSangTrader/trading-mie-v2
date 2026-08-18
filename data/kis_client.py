@@ -28,6 +28,35 @@ KIS API 클라이언트 (환경별 자동 선택)
   * 기존 기능 100% 유지
   * 데이터 순서만 보장 추가
   * TechnicalAnalyzer에서 closes[-1]이 현재가를 올바르게 반영
+
+【2026-08-14】Phase 5-2: 개별 종목 기본분석(PER/PBR) 조회 메서드 추가
+- 변경 사항:
+  * get_stock_fundamental(stock_code) 메서드 신규 추가
+  * FHKST01010100(국내주식 현재가 시세) API 사용, FID_COND_MRKT_DIV_CODE="J"
+  * PER, PBR, EPS, BPS 실시간 조회 (개별 종목 전용, 지수에는 사용 불가)
+  * 배당수익률은 이 API에 없음 - None 반환, 호출부(ValuationAnalyzer)에서 폴백 처리
+- 목적: ValuationAnalyzer Mock 데이터 → 실제 개별 종목 데이터 연동 (신뢰도 41.6% → 70%+ 목표)
+- 영향: 기존 메서드(get_kospi_kosdaq, get_daily_price) 변경 없음, 100% 하위 호환
+
+【2026-08-17】배당수익률 일괄 조회 메서드 추가 (Phase 5-8)
+- 변경 사항:
+  * get_dividend_rates(market, days_back=365) 메서드 신규 추가
+  * "국내주식 배당률 상위"(순위분석) API 사용, tr_id: HHKDB13470100
+    (KIS 공식 GitHub reference: open-trading-api/examples_llm/domestic_stock/
+     dividend_rate/dividend_rate.py 참고해서 그대로 이식함)
+  * get_stock_fundamental()과 달리 "종목 하나씩" 조회하는 API가 아니라 "시장
+    전체 랭킹"을 한 번에 반환하는 API라서, 종목 수만큼 호출하지 않고 시장(KOSPI/
+    KOSDAQ)당 1회(+페이지네이션)만 호출해서 {종목코드: 배당률} 딕셔너리로 반환
+  * tr_cont 헤더가 "M"이면 다음 페이지가 더 있다는 뜻 - CTS_AREA는 그대로 두고
+    tr_cont만 "N"으로 바꿔 재요청 (공식 레퍼런스와 동일한 방식, 최대 10페이지)
+  * GB3="2"(현금배당) 고정 - 통상 "배당수익률"이라고 하면 현금배당 기준
+- 영향: get_stock_fundamental()은 변경 없음(여전히 dividend_yield=None 반환).
+  실제 배당수익률은 이 신규 메서드로 별도 조회해서 호출부(ValuationCollector)가
+  종목코드 기준으로 병합한다.
+- 【사용자 컴퓨터 실측(2026-08-17)】1차 시도에서 timeout=10초로 ReadTimeout 발생.
+  KOSPI 전체 종목의 1년치 배당을 서버에서 집계하는 랭킹 API라서 개별 종목
+  시세 조회(get_stock_fundamental 등)보다 응답이 오래 걸리는 것으로 보임 →
+  이 메서드에 한해 timeout을 30초로 늘림. 재시도 결과 확인 필요.
 ================================================================================
 """
 import requests
@@ -238,6 +267,202 @@ class KISClient:
             
         except Exception as e:
             print(f"❌ KOSPI/KOSDAQ 조회 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    def get_stock_fundamental(self, stock_code: str) -> Dict:
+        """
+        개별 종목 기본분석 지표 조회 (PER, PBR, EPS, BPS)
+        【Phase 5-2 신규】ValuationAnalyzer 실제 데이터 연동용
+
+        - API: 국내주식 현재가 시세 (inquire-price)
+        - tr_id: FHKST01010100
+        - FID_COND_MRKT_DIV_CODE: "J" (KRX 주식 - 지수와 달리 "U"가 아님)
+
+        주의:
+        - 이 API는 지수(KOSPI/KOSDAQ)가 아닌 "개별 종목"에만 사용 가능
+          (지수는 PER/PBR 개념이 없음 - 구성종목 가중평균 방식은 별도 산출 필요)
+        - 배당수익률(dividend_yield)은 이 API에 포함되지 않음.
+          KIS "예탁원정보(배당)" API(HHKDB669102C0) 등 별도 연동이 필요하며,
+          현재는 조회하지 않고 None으로 반환 (호출부에서 폴백 처리)
+        """
+        try:
+            print(f"\n📈 종목 기본분석 지표 조회 중 ({stock_code})...")
+
+            if not self.access_token:
+                if not self.get_access_token():
+                    return {}
+
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+
+            headers = {
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.api_key,
+                "appsecret": self.api_secret,
+                "tr_id": "FHKST01010100",  # 【중요】국내주식 현재가 시세 (개별 종목 전용)
+                "custtype": "P"
+            }
+
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",  # 【중요】J: 주식 (지수의 "U"와 다름)
+                "FID_INPUT_ISCD": stock_code
+            }
+
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                verify=False,
+                timeout=10
+            )
+
+            print(f"   상태 코드: {response.status_code}")
+
+            if response.status_code != 200:
+                print(f"   ❌ 조회 실패! {response.status_code}")
+                return {}
+
+            data = response.json()
+            rt_cd = data.get('rt_cd', '0')
+
+            if rt_cd != '0':
+                print(f"   ❌ API 오류: {data.get('msg1', '')}")
+                return {}
+
+            output = data.get('output', {})
+
+            def _to_float(value, default=0.0):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return default
+
+            result = {
+                "symbol": stock_code,
+                "current_price": _to_float(output.get('stck_prpr')),
+                "per": _to_float(output.get('per')),
+                "pbr": _to_float(output.get('pbr')),
+                "eps": _to_float(output.get('eps')),
+                "bps": _to_float(output.get('bps')),
+                # 배당수익률: inquire-price 응답에 없음 (별도 API 필요) → 폴백은 호출부 책임
+                "dividend_yield": None,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            print(f"   ✅ PER: {result['per']:.2f} / PBR: {result['pbr']:.2f} "
+                  f"/ EPS: {result['eps']:.0f} / BPS: {result['bps']:.0f}")
+
+            return result
+
+        except Exception as e:
+            print(f"❌ 종목 기본분석 지표 조회 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    def get_dividend_rates(self, market: str, days_back: int = 365) -> Dict[str, float]:
+        """
+        시장 전체 배당률(현금배당 기준) 일괄 조회
+        【Phase 5-8 신규】배당수익률 실제 데이터 연동용
+
+        - API: 국내주식 배당률 상위(순위분석)
+        - tr_id: HHKDB13470100
+        - get_stock_fundamental()과 다르게 "종목 하나"가 아니라 "시장 전체 랭킹"을
+          한 번에 반환하는 API다. 그래서 종목 수만큼이 아니라 시장당 1회(+필요시
+          페이지네이션)만 호출한다.
+
+        Args:
+            market: "KOSPI" 또는 "KOSDAQ"
+            days_back: 조회 기준일(F_DT~T_DT) 범위 - 오늘부터 며칠 전까지의 배당을
+                집계할지 (기본 365일 = 최근 1년 배당 기준, 통상적인 trailing
+                배당수익률 개념과 동일)
+
+        Returns:
+            {"005930": 2.15, "000660": 1.80, ...} 형태의 {종목코드: 배당률(%)} 딕셔너리.
+            조회 실패 시 빈 딕셔너리 (호출부는 병합할 데이터가 없다고 보고 그대로 진행)
+        """
+        market_params = {
+            "KOSPI": {"gb1": "1", "upjong": "0001"},
+            "KOSDAQ": {"gb1": "3", "upjong": "1001"},
+        }
+        if market not in market_params:
+            raise ValueError(f"알 수 없는 시장 구분: {market}")
+
+        try:
+            print(f"\n💰 {market} 배당률 일괄 조회 중...")
+
+            if not self.access_token:
+                if not self.get_access_token():
+                    return {}
+
+            url = f"{self.base_url}/uapi/domestic-stock/v1/ranking/dividend-rate"
+            t_dt = datetime.now().strftime("%Y%m%d")
+            f_dt = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+
+            dividend_map: Dict[str, float] = {}
+            cts_area = " "
+            tr_cont = ""
+            max_pages = 10
+
+            for page in range(max_pages):
+                headers = {
+                    "authorization": f"Bearer {self.access_token}",
+                    "appkey": self.api_key,
+                    "appsecret": self.api_secret,
+                    "tr_id": "HHKDB13470100",
+                    "custtype": "P",
+                    "tr_cont": tr_cont,
+                }
+                params = {
+                    "CTS_AREA": cts_area,
+                    "GB1": market_params[market]["gb1"],
+                    "UPJONG": market_params[market]["upjong"],
+                    "GB2": "0",   # 전체 종목선택
+                    "GB3": "2",   # 현금배당
+                    "F_DT": f_dt,
+                    "T_DT": t_dt,
+                    "GB4": "0",   # 전체(결산+중간배당)
+                }
+
+                response = requests.get(
+                    url, headers=headers, params=params, verify=False, timeout=30
+                )
+
+                print(f"   [{page + 1}페이지] 상태 코드: {response.status_code}")
+
+                if response.status_code != 200:
+                    print(f"   ❌ 조회 실패! {response.status_code}")
+                    break
+
+                data = response.json()
+                if data.get('rt_cd', '0') != '0':
+                    print(f"   ❌ API 오류: {data.get('msg1', '')}")
+                    break
+
+                for row in data.get('output', []):
+                    symbol = str(row.get('sht_cd', '')).strip()
+                    rate = row.get('divi_rate')
+                    if not symbol or rate in (None, ''):
+                        continue
+                    try:
+                        dividend_map[symbol] = float(rate)
+                    except (TypeError, ValueError):
+                        continue
+
+                # 다음 페이지 여부 - 응답 헤더 tr_cont가 "M"이면 더 있음
+                # (CTS_AREA는 공식 레퍼런스와 동일하게 그대로 유지, tr_cont만 갱신)
+                if response.headers.get('tr_cont') == "M":
+                    tr_cont = "N"
+                    time.sleep(0.2)
+                    continue
+                break
+
+            print(f"   ✅ {market} 배당률 {len(dividend_map)}종목 확보")
+            return dividend_map
+
+        except Exception as e:
+            print(f"❌ {market} 배당률 일괄 조회 오류: {e}")
             import traceback
             traceback.print_exc()
             return {}

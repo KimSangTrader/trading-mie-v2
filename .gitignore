@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+data/krx/incoming/*
+data/krx/archive/*
+data/krx/latest/*
+!data/krx/incoming/.gitkeep
+!data/krx/archive/.gitkeep
+!data/krx/latest/.gitkeep
