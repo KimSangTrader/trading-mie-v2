@@ -2,6 +2,11 @@
 AdvancedCombinedAnalyzer - 고급 통합 엔진 (Phase 4)
 기술지표 + 시장필터 + 기본분석 3가지 통합
 최종 신호 + 신뢰도 + 거래 강도
+
+【2026-08-14】Phase 5-5: ValuationAnalyzer 상대평가 계약 반영
+- ValuationAnalyzer가 시장(KOSPI/KOSDAQ) 중앙값 대비 상대평가로 바뀌면서,
+  data에 market_per/market_pbr/market_dividend_yield가 함께 있어야
+  valuation_score가 실제로 계산됨 (없으면 중립 50점으로 처리됨)
 """
 
 import sys
@@ -169,9 +174,10 @@ if __name__ == "__main__":
     
     logging.basicConfig(level=logging.INFO, format='%(message)s')
     
-    # Mock 데이터
+    # Mock 데이터 (Phase 5-5: ValuationAnalyzer 상대평가 계약 - market_per 등 포함)
     data = {
-        'symbol': '0001',
+        'symbol': '005930',
+        'market': 'KOSPI',
         'dates': ['20260812'] * 60,
         'opens': [7500] * 60,
         'highs': [7600] * 60,
@@ -183,8 +189,11 @@ if __name__ == "__main__":
         'kosdaq_index': 858.91,
         'kosdaq_change_rate': 0.12,
         'per': 12.5,
+        'market_per': 18.4,
         'pbr': 1.1,
-        'dividend_yield': 3.2
+        'market_pbr': 1.72,
+        'dividend_yield': 3.2,
+        'market_dividend_yield': 2.05,
     }
     
     print("=" * 80)

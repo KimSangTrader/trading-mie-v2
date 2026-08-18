@@ -145,6 +145,32 @@ CREATE TABLE IF NOT EXISTS system_status (
 
 CREATE INDEX idx_system_status_timestamp ON system_status(timestamp DESC);
 
+-- 9. 종목별 밸류에이션(상대평가) 테이블 (Phase 5)
+CREATE TABLE IF NOT EXISTS stock_valuation (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ticker VARCHAR(10) NOT NULL,
+    market VARCHAR(10), -- 'KOSPI', 'KOSDAQ'
+    per DECIMAL(10, 2),
+    pbr DECIMAL(10, 2),
+    dividend_yield DECIMAL(5, 2),
+    market_per DECIMAL(10, 2),
+    market_pbr DECIMAL(10, 2),
+    market_dividend_yield DECIMAL(5, 2),
+    per_relative_score DECIMAL(5, 2),
+    pbr_relative_score DECIMAL(5, 2),
+    dividend_relative_score DECIMAL(5, 2),
+    valuation_score DECIMAL(5, 2),
+    data_quality DECIMAL(5, 2), -- 0~100, 확보된 지표 비율
+    data_source VARCHAR(20), -- 'relative', 'insufficient_data', 'not_applicable'
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_stock_valuation_ticker_timestamp UNIQUE(ticker, timestamp)
+);
+
+CREATE INDEX idx_stock_valuation_timestamp ON stock_valuation(timestamp DESC);
+CREATE INDEX idx_stock_valuation_ticker ON stock_valuation(ticker);
+CREATE INDEX idx_stock_valuation_market ON stock_valuation(market);
+
 -- ==========================================
 -- 권한 설정
 -- ==========================================
@@ -163,3 +189,4 @@ COMMENT ON TABLE technical_indicators IS 'MACD, RSI, 볼린저밴드, 이동평�
 COMMENT ON TABLE analysis_results IS '7개 분석기 종합 점수 및 추천';
 COMMENT ON TABLE trading_history IS '자동매매 거래 기록 (향후)';
 COMMENT ON TABLE system_status IS '시스템 상태 모니터링';
+COMMENT ON TABLE stock_valuation IS '종목별 PER/PBR/배당수익률 및 시장(KOSPI/KOSDAQ) 상대평가 결과';

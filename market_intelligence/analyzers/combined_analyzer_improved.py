@@ -13,6 +13,14 @@ CombinedAnalyzerImproved - 개선된 통합 분석기 (수정 버전)
 【2026-08-13】버그 수정
 - BaseAnalyzer에서 _get_timestamp() 상속
 - ValuationAnalyzer Mock 데이터 보완 (PER, PBR, 배당수익률)
+
+【2026-08-14】Phase 5-5: ValuationAnalyzer 상대평가 계약 반영
+- ValuationAnalyzer가 절대값 점수에서 시장(KOSPI/KOSDAQ) 중앙값 대비 상대평가로
+  바뀌면서, 이 클래스가 넘기는 data에는 per/pbr/dividend_yield뿐 아니라
+  market_per/market_pbr/market_dividend_yield도 함께 있어야 실제 점수가 계산됨
+  (없으면 ValuationAnalyzer가 중립 50점 + data_quality 낮음으로 스스로 처리)
+- 이 클래스(combined_score, confidence 계산) 자체는 변경 없음 — val_score의
+  "의미"만 절대값에서 상대값 기반으로 바뀜
 """
 
 import logging
@@ -204,9 +212,10 @@ class CombinedAnalyzerImproved(BaseAnalyzer):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
-    # Mock 데이터 (ValuationAnalyzer용 필드 추가)
+    # Mock 데이터 (ValuationAnalyzer용 필드 추가 - Phase 5-5 상대평가 계약)
     data = {
-        'symbol': '0001',
+        'symbol': '005930',
+        'market': 'KOSPI',
         'closes': [6813.34] * 60,
         'opens': [6800] * 60,
         'highs': [6850] * 60,
@@ -214,25 +223,28 @@ if __name__ == "__main__":
         'volumes': [450000] * 60,
         'kospi_index': 6813.34,
         'kosdaq_index': 861.37,
-        # ValuationAnalyzer 추가
+        # ValuationAnalyzer 추가 (Phase 5-5: 종목값 + 시장 중앙값 쌍으로 제공)
         'per': 15.5,
+        'market_per': 18.4,
         'pbr': 1.2,
-        'dividend_yield': 2.5
+        'market_pbr': 1.72,
+        'dividend_yield': 2.5,
+        'market_dividend_yield': 2.05,
     }
-    
+
     analyzer = CombinedAnalyzerImproved()
     result = analyzer.run(data)
-    
+
     print("\n" + "=" * 80)
-    print("【CombinedAnalyzerImproved 테스트】신뢰도 개선 완료")
+    print("【CombinedAnalyzerImproved 테스트】Phase 5-5 상대평가 반영")
     print("=" * 80)
     print(f"점수: {result['score']:.1f}/100")
-    print(f"신뢰도: {result['confidence']:.1f}% (이전 21% → 현재 38% ✅ 약 1.8배 개선)")
+    print(f"신뢰도: {result['confidence']:.1f}%")
     print(f"\n【세부 지표】")
-    print(f"  신호 일치도: {result['details']['signal_agreement']:.1f}% (높음)")
+    print(f"  신호 일치도: {result['details']['signal_agreement']:.1f}%")
     print(f"  데이터 품질: {result['details']['data_quality']:.1f}%")
     print(f"  시장 확실성: {result['details']['market_certainty']:.1f}%")
     print(f"  신호 강도: {result['details']['signal_strength']:.1f}%")
-    print("\n【다음 개선】")
-    print(f"  Phase 5-2: ValuationAnalyzer 실제 데이터 연동 → 신뢰도 70%+")
+    print("\n【참고】")
+    print(f"  val_score는 이제 ValuationAnalyzer의 시장 대비 상대평가 결과 (Phase 5-5)")
     print("=" * 80)

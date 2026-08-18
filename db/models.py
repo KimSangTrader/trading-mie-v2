@@ -223,6 +223,49 @@ class SystemStatus(Base):
         return f"<SystemStatus(timestamp={self.timestamp}, status={self.status})>"
 
 # ==========================================
+# 9. StockValuation 모델 (Phase 5: 상대평가 방식)
+# ==========================================
+class StockValuation(Base):
+    """종목별 PER/PBR/배당수익률 및 시장(KOSPI/KOSDAQ) 상대평가 결과
+
+    ValuationCollector가 수집한 원본 값(per/pbr/dividend_yield)과
+    MarketValuation이 계산한 시장 중앙값(market_per 등),
+    ValuationAnalyzer가 산출한 상대점수(*_relative_score)/최종점수를 함께 저장한다.
+    market_data 등 시장 전체를 다루는 테이블과 달리 한 번의 수집(timestamp)에
+    종목 수만큼 행이 생기므로(sector_data와 동일한 패턴) timestamp 단독으로는
+    unique 제약을 걸지 않는다 - 대신 (ticker, timestamp) 조합으로 스키마에서
+    유일성을 보장한다(schema.sql 참고).
+    """
+    __tablename__ = "stock_valuation"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    ticker = Column(String(10), nullable=False)
+    market = Column(String(10))  # 'KOSPI', 'KOSDAQ'
+    per = Column(Numeric(10, 2))
+    pbr = Column(Numeric(10, 2))
+    dividend_yield = Column(Numeric(5, 2))
+    market_per = Column(Numeric(10, 2))
+    market_pbr = Column(Numeric(10, 2))
+    market_dividend_yield = Column(Numeric(5, 2))
+    per_relative_score = Column(Numeric(5, 2))
+    pbr_relative_score = Column(Numeric(5, 2))
+    dividend_relative_score = Column(Numeric(5, 2))
+    valuation_score = Column(Numeric(5, 2))
+    data_quality = Column(Numeric(5, 2))  # 0~100, 확보된 지표 비율
+    data_source = Column(String(20))  # 'relative', 'insufficient_data', 'not_applicable'
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_stock_valuation_timestamp', 'timestamp'),
+        Index('idx_stock_valuation_ticker', 'ticker'),
+        Index('idx_stock_valuation_market', 'market'),
+    )
+
+    def __repr__(self):
+        return f"<StockValuation(ticker={self.ticker}, market={self.market}, per={self.per}, valuation_score={self.valuation_score})>"
+
+# ==========================================
 # Database Session 관리
 # ==========================================
 
@@ -259,6 +302,7 @@ __all__ = [
     'AnalysisResults',
     'TradingHistory',
     'SystemStatus',
+    'StockValuation',
     'get_database_url',
     'create_session',
     'create_tables',
