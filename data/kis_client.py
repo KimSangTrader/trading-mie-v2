@@ -69,6 +69,7 @@ KIS API 클라이언트 (환경별 자동 선택)
 import requests
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -79,6 +80,19 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
+
+# 【2026-08-22 추가, Phase 5-11 라이브 검증 중 발견】이 파일 곳곳의 print()가
+# ✅/❌/⚠️/📊 이모지를 찍는데, Windows에서 출력이 파이프/파일로 리다이렉트되면
+# 파이썬이 시스템 기본 코드페이지(cp949)를 써서 UnicodeEncodeError로 죽는 문제가
+# 있었다 - main.py에도 동일하게 넣었지만(그쪽이 진입점이라 프로세스 전체를
+# 커버함), 이 파일을 단독 실행(`python data/kis_client.py`)하거나 `python -c`로
+# 이 모듈만 따로 쓸 때도 안전하도록 여기도 넣어둔다. 리눅스(EC2)는 기본 UTF-8이라
+# 이 블록이 사실상 아무 영향 없다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 class KISClient:
     """KIS API 클라이언트 - 환경별 자동 선택"""
@@ -396,6 +410,122 @@ class KISClient:
             print(f"❌ 종목 기본분석 지표 조회 오류: {e}")
             import traceback
             traceback.print_exc()
+            return {}
+
+    def get_stock_daily_chart(self, stock_code: str, days: int = 60) -> Dict:
+        """
+        개별 종목 일봉(OHLCV) 조회 - TechnicalAnalyzer 실데이터 연동용
+        【2026-08-22 신규, Phase 5-11】
+
+        - 배경: TechnicalAnalyzer.validate()는 closes/opens/highs/lows/volumes
+          (60개 이상 캔들)를 요구하는데, 이 파일에는 그걸 "개별 종목" 코드로
+          조회하는 메서드가 전혀 없었다. 기존 get_daily_price()/get_daily_chart()는
+          FID_COND_MRKT_DIV_CODE="U"(업종/지수 전용) + tr_id=FHPUP02120000이라
+          KOSPI/KOSDAQ 지수 코드("0001"/"1001")에만 쓸 수 있고 개별 종목 코드로는
+          쓸 수 없다(파일 맨 아래 __main__ 테스트도 "0001"로 호출하는 것 참고).
+          get_stock_fundamental()과 같은 계열(FID_COND_MRKT_DIV_CODE="J")로
+          새로 만들었다.
+        - API: 국내주식기간별시세(일/주/월/년) (inquire-daily-itemchartprice)
+        - tr_id: FHKST03010100
+        - 지수 조회(get_daily_price)와 달리 날짜 범위를 한 번에 요청하는 API라서,
+          하루씩 반복 조회할 필요 없이 종목 1개당 API 호출 1번이면 충분하다
+          (응답이 최대 100건까지 한 번에 옴 - get_daily_price의 while 루프 방식과 다름).
+        - 종목별 호출 시 rate limit은 호출부(main.py)가 기존 관례(0.2초 -
+          market_intelligence/collectors/valuation_collector.py의
+          _DEFAULT_RATE_LIMIT_SEC)를 따라 책임진다 - 이 메서드 자체는 호출 1번만.
+        - 【주의】이 세션은 실제 KIS API로 응답 필드명을 검증할 수 없었다(클라우드
+          샌드박스 네트워크 제약). 아래 필드명(stck_bsop_date/stck_oprc/stck_hgpr/
+          stck_lwpr/stck_clpr/acml_vol)은 KIS Open API 공식 문서 관례를 따라
+          작성했으나, get_stock_fundamental() 때도 그랬듯 실제 응답과 다를 수
+          있으니 반드시 종목 1~2개로 먼저 실제 호출해 필드가 맞는지 확인 필요
+          (사용자 컴퓨터/서버에서 라이브 검증 - 이 세션은 할 수 없음).
+        """
+        try:
+            print(f"\n📊 개별 종목 일봉 데이터 조회 중 ({stock_code}, {days}일)...")
+
+            if not self.ensure_valid_token():
+                return {}
+
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+
+            headers = {
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.api_key,
+                "appsecret": self.api_secret,
+                "tr_id": "FHKST03010100",  # 【중요】국내주식기간별시세(일/주/월/년) - 개별 종목 전용
+                "custtype": "P"
+            }
+
+            # days*1.6일 전부터 오늘까지 - 주말/공휴일 제외하고 실거래일 기준
+            # days개를 확보하기 위한 여유(get_daily_price와 동일한 관례)
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y%m%d")
+
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",  # 【중요】J: 주식 (지수의 "U"와 다름)
+                "FID_INPUT_ISCD": stock_code,
+                "FID_INPUT_DATE_1": start_date,
+                "FID_INPUT_DATE_2": end_date,
+                "FID_PERIOD_DIV_CODE": "D",      # 일봉
+                "FID_ORG_ADJ_PRC": "0"           # 수정주가 반영
+            }
+
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                verify=False,
+                timeout=10
+            )
+
+            if response.status_code != 200:
+                print(f"   ❌ 조회 실패! {stock_code} - {response.status_code}")
+                return {}
+
+            data = response.json()
+            rt_cd = data.get('rt_cd', '0')
+            if rt_cd != '0':
+                print(f"   ❌ API 오류 ({stock_code}): {data.get('msg1', '')}")
+                return {}
+
+            output_list = data.get('output2', [])
+            if not output_list:
+                print(f"   ℹ️  데이터 없음 ({stock_code})")
+                return {}
+
+            rows = []
+            for item in output_list:
+                date_val = item.get('stck_bsop_date', '')
+                if not date_val:
+                    continue
+                rows.append({
+                    "date": date_val,
+                    "open": float(item.get('stck_oprc', 0)),
+                    "high": float(item.get('stck_hgpr', 0)),
+                    "low": float(item.get('stck_lwpr', 0)),
+                    "close": float(item.get('stck_clpr', 0)),
+                    "volume": int(item.get('acml_vol', 0)),
+                })
+
+            # 날짜순(오래된 -> 최신) 정렬 - closes[-1]이 최신 종가가 되도록 보장
+            # (get_daily_price와 동일한 관례)
+            rows.sort(key=lambda r: r["date"])
+
+            result = {
+                "symbol": stock_code,
+                "dates": [r["date"] for r in rows],
+                "opens": [r["open"] for r in rows],
+                "highs": [r["high"] for r in rows],
+                "lows": [r["low"] for r in rows],
+                "closes": [r["close"] for r in rows],
+                "volumes": [r["volume"] for r in rows],
+            }
+
+            print(f"   ✅ {stock_code}: {len(rows)}일 데이터 수집 완료")
+            return result
+
+        except Exception as e:
+            print(f"❌ 개별 종목 일봉 조회 오류 ({stock_code}): {e}")
             return {}
 
     # get_dividend_rates()는 여기 있었으나 제거됨 - 실측 결과 부적합한 API였음

@@ -86,6 +86,38 @@ Valuation)를 등록하고, market_data 대부분(섹터/수급/테마/뉴스/�
   샌드박스 네트워크 제약, 게다가 시각 의존 로직이라 사용자 컴퓨터/서버에서
   날짜를 앞뒤로 바꿔가며 시나리오별로 확인이 필요함) - 사용자 컴퓨터에서
   단위 테스트 + 서버에서 실제 배포 후 라이브 검증 필요.
+
+【2026-08-22】TechnicalAnalyzer 실데이터 연동 - 매 종목 조용히 스킵되던 문제 수정 (Phase 5-11)
+- 배경: EC2에 배포한 serve 모드를 라이브 검증하던 중(실제로는 오늘이 토요일이라
+  주말 스킵 로직이 정상 동작해 대기 중이었던 것으로 확인됨 - 별도 이슈 아님),
+  전체 2,718종목 규모로 `python main.py all`을 수동 실행해 확인하는 과정에서
+  `technical: validate=False`가 종목 수만큼(시험 20회) 찍히는 걸 발견함.
+  IntelligenceManager.run_all()이 validate 실패한 분석기를 에러 없이 조용히
+  건너뛰고 나머지로만 점수를 계산하는 구조라서(success_count/fail_count는
+  기록하지만 전체 success는 그대로 True), 지금까지 결과가 정상으로만 보였음 -
+  실제로는 TechnicalAnalyzer(가중치 0.18)가 처음부터 한 번도 반영된 적이 없었음.
+- 원인: TechnicalAnalyzer.validate()/analyze()는 closes/opens/highs/lows/volumes
+  (60개 이상 캔들)를 요구하는데, build_shared_market_data()가 채우는 건
+  macd_value/rsi_value/bb_upper 같은 전혀 다른 모양의 모의값이었음 - 애초에
+  두 쪽이 서로 안 맞는 상태로 8/18일 종목별 루프 확장 때 그대로 넘어감.
+- 조사 결과: data/kis_client.py에 개별 종목(FID_COND_MRKT_DIV_CODE="J")용
+  일봉 조회 메서드가 아예 없었음 - 기존 get_daily_price()/get_daily_chart()는
+  지수(KOSPI/KOSDAQ, "U") 전용이라 개별 종목 코드로는 쓸 수 없음.
+- 조치: data/kis_client.py에 get_stock_daily_chart(stock_code, days=60) 신규
+  추가(국내주식기간별시세 API, tr_id=FHKST03010100, 종목당 호출 1번으로 60일치
+  획득). analyze_stock()이 종목별 루프 안에서 이걸 호출해 closes/opens/highs/
+  lows/volumes를 채우도록 수정 - 조회 실패해도(신규상장 등) technical만
+  스킵되고 나머지 6개 분석기는 그대로 진행(기존 "한 종목 실패가 전체를 막지
+  않는다" 원칙 유지). rate limit은 valuation_collector.py의 기존 관례(0.2초)를
+  그대로 따름.
+- 영향: 종목별 루프에 API 호출이 추가되면서 전체(all) 실행 시간이 기존
+  "몇 초"에서 "최소 수 분~십수 분"(2,718종목 × 0.2초 + 네트워크 왕복)으로
+  늘어남 - 하루 한 번(19시) 배치라 문제는 없으나, 이전에 관찰한 "순식간에
+  끝난다"는 더 이상 해당하지 않게 됨. 시험 모드(20종목)는 여전히 몇 초 수준.
+- 이 세션은 이번에도 실제 KIS API로 get_stock_daily_chart()의 응답 필드명을
+  검증할 수 없었다(클라우드 샌드박스 네트워크 제약) - kis_client.py 변경이력에
+  적어둔 대로, 반드시 종목 1~2개 소규모로 먼저 실제 호출해 필드가 맞는지
+  확인 후 시험(20종목) → 전체(all) 순서로 라이브 검증 필요.
 ================================================================================
 """
 
@@ -98,6 +130,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
+
+# 【2026-08-22 추가, Phase 5-11 라이브 검증 중 발견】stdout/stderr을 UTF-8로 강제한다.
+# 이 파일과 data/kis_client.py 곳곳에서 ✅/❌/⚠️/📊 등 이모지를 print()/logger로
+# 찍는데, Windows에서 콘솔에 직접 출력할 땐 문제없다가도 파이프(`| Select-String`
+# 등)나 파일 리다이렉트로 연결하는 순간 파이썬이 출력 인코딩을 시스템 기본
+# 코드페이지(한국어 Windows는 cp949)로 잡아버려서 "'cp949' codec can't encode
+# character '✅'..." UnicodeEncodeError로 죽는다. 이게 KISClient() 생성자
+# 안(__init__의 print)에서 터지면 setup_manager_and_client()의 try/except가
+# 조용히 삼켜서 kis_client=None(Mock 모드)으로 빠지고, 기술지표 조회 자체가
+# 시도조차 안 된 채로 "정상 종료"돼버린다 - 실제로 EC2/서버는 리눅스(기본 UTF-8)라
+# 안 겪었지만, 로컬 Windows에서 로그를 파일로 남기거나 파이프로 필터링할 때마다
+# 재현되므로 여기서 근본적으로 고쳐둔다. reconfigure()가 없는 아주 오래된 파이썬
+# 이거나 이미 재구성 불가능한 스트림이면 조용히 무시(Linux 서버는 원래 UTF-8이라
+# 이 블록이 사실상 아무 영향 없음).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 from market_intelligence.intelligence_manager import IntelligenceManager
 from market_intelligence.analyzers import (
@@ -119,6 +170,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TRIAL_STOCK_COUNT = 20  # 안전을 위한 기본값(valuation_pipeline.py와 동일한 관례)
+
+# 【2026-08-22】종목별 일봉(OHLCV) 조회 rate limit - TechnicalAnalyzer 실데이터 연동용.
+# market_intelligence/collectors/valuation_collector.py의 _DEFAULT_RATE_LIMIT_SEC와
+# 동일한 기존 관례(0.2초)를 그대로 따른다.
+_TECHNICAL_FETCH_RATE_LIMIT_SEC = 0.2
 
 # ============ 상시 서비스 모드(serve) 설정 ============
 KST = ZoneInfo("Asia/Seoul")
@@ -279,11 +335,34 @@ def get_latest_stock_valuations(session, limit: Optional[int] = None) -> List[Di
 
 
 def analyze_stock(manager: IntelligenceManager, shared_data: Dict[str, Any],
-                   stock_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                   stock_row: Dict[str, Any],
+                   kis_client: Optional[KISClient] = None) -> Optional[Dict[str, Any]]:
     """시장 공통 데이터(shared_data)에 종목별 밸류에이션 실데이터(stock_row)를 덮어씌워
     7개 분석기를 한 번 실행한다. 실패해도 전체 루프를 막지 않도록 예외를 잡아 None을
-    돌려준다(호출부에서 건너뜀)."""
+    돌려준다(호출부에서 건너뜀).
+
+    【2026-08-22 수정, Phase 5-11】TechnicalAnalyzer가 여태 매 종목·매 사이클
+    validate() 실패로 조용히 스킵되고 있던 문제(가중치 18% 미반영)를 발견해서 -
+    kis_client.get_stock_daily_chart()로 종목별 실제 60일 일봉(OHLCV)을 조회해
+    closes/opens/highs/lows/volumes를 채운다. 조회 실패(네트워크 오류, 상장 60일
+    미만 신규종목 등)해도 이 함수 자체는 계속 진행 - 그 경우 technical만 여전히
+    validate() 실패로 스킵되고 나머지 6개 분석기는 정상 진행된다(에러로 전체 종목을
+    막지 않음, 기존 원칙과 동일). kis_client가 없으면(Mock 모드) 기존처럼 스킵."""
     market_data = {**shared_data, **stock_row}
+
+    if kis_client is not None:
+        chart = kis_client.get_stock_daily_chart(stock_row.get("symbol"), days=60)
+        if chart and len(chart.get("closes", [])) >= 60:
+            market_data.update({
+                "closes": chart["closes"],
+                "opens": chart["opens"],
+                "highs": chart["highs"],
+                "lows": chart["lows"],
+                "volumes": chart["volumes"],
+            })
+        # KIS API 호출 간격 제한 (기존 관례 0.2초 - valuation_collector.py와 동일)
+        time.sleep(_TECHNICAL_FETCH_RATE_LIMIT_SEC)
+
     try:
         results = manager.run_all(market_data)
     except Exception as e:
@@ -385,6 +464,11 @@ def run_analysis_cycle(manager: IntelligenceManager, analyzers: List[Any],
         logger.warning("⚠️  모의 데이터로 진행 (실제 데이터 조회 실패)")
 
     # 4. 분석기 배선 sanity check (종목 루프 전에 한 번만 - 루프마다 반복하면 너무 장황함)
+    # 【2026-08-22 주석 추가】technical은 여기서 항상 validate=False로 나오는 게 정상이다 -
+    # closes/opens/highs/lows/volumes는 종목별 실제 데이터(analyze_stock 내부에서
+    # kis_client.get_stock_daily_chart()로 조회)라서 시장 공통 데이터(shared_data)만
+    # 가지고 하는 이 배선 점검 단계에는 애초에 없다. 실제 검증은 Step 6 종목별 루프에서
+    # 이루어진다.
     logger.info("\n【Step 4】분석기 배선 확인 (시장 공통 데이터만으로 1회 점검)...")
     for analyzer in analyzers:
         try:
@@ -412,11 +496,19 @@ def run_analysis_cycle(manager: IntelligenceManager, analyzers: List[Any],
     logger.info(f"✅ {len(stock_rows)}종목 조회 완료 - 종목별 분석 시작")
 
     logger.info("\n【Step 6】종목별 7개 분석기 실행 중...")
+    if kis_client is not None:
+        logger.info(
+            f"   ⏱️  종목별 실제 일봉(OHLCV) 조회 포함 - 종목당 약 "
+            f"{_TECHNICAL_FETCH_RATE_LIMIT_SEC}초+ 소요 (전체 {len(stock_rows)}종목 기준 "
+            f"최소 {len(stock_rows) * _TECHNICAL_FETCH_RATE_LIMIT_SEC / 60:.1f}분 이상 예상)"
+        )
     results = []
-    for stock_row in stock_rows:
-        result = analyze_stock(manager, shared_data, stock_row)
+    for idx, stock_row in enumerate(stock_rows, start=1):
+        result = analyze_stock(manager, shared_data, stock_row, kis_client)
         if result is not None:
             results.append(result)
+        if kis_client is not None and idx % 100 == 0:
+            logger.info(f"   ... {idx}/{len(stock_rows)}종목 처리 중")
 
     if not results:
         logger.error("❌ 분석에 성공한 종목이 하나도 없습니다.")
