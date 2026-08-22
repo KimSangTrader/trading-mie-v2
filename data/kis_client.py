@@ -53,10 +53,17 @@ KIS API 클라이언트 (환경별 자동 선택)
 - 영향: get_stock_fundamental()은 변경 없음(여전히 dividend_yield=None 반환).
   실제 배당수익률은 이 신규 메서드로 별도 조회해서 호출부(ValuationCollector)가
   종목코드 기준으로 병합한다.
-- 【사용자 컴퓨터 실측(2026-08-17)】1차 시도에서 timeout=10초로 ReadTimeout 발생.
-  KOSPI 전체 종목의 1년치 배당을 서버에서 집계하는 랭킹 API라서 개별 종목
-  시세 조회(get_stock_fundamental 등)보다 응답이 오래 걸리는 것으로 보임 →
-  이 메서드에 한해 timeout을 30초로 늘림. 재시도 결과 확인 필요.
+- 【사용자 컴퓨터 실측(2026-08-17)】1차 시도에서 timeout=10초로 ReadTimeout 발생 →
+  30초로 늘려서 재시도한 결과, 이번엔 응답은 왔지만 이 방식 자체가 부적합함이
+  드러남: (a) KOSPI 20종목까지만 반환됨(랭킹 API라 상위권만 줌 - 애초에 종목
+  수천 개를 커버할 수 없는 API였음), (b) divi_rate 필드가 "배당수익률(%)"이
+  아니라 "액면배당률"이었음 - 삼성화재해상보험1우 실측: per_sto_divi_amt(배당금)
+  =19505원, divi_rate=3901.00 → 19505/500(액면가)*100=3901.0로 정확히 일치.
+  액면가는 종목마다 달라서 종목 간 상대비교에 쓸 수 없는 값이었다.
+  → get_dividend_rates()는 이 버전에서 완전히 제거. 대신 사용자가 첨부한 문서
+  ("한국거래소를 이용한 배당율조회와 실시간 조회 연동방법.docx") 제안대로
+  KRX 정보데이터시스템(data.krx.co.kr, KIS와 무관한 별도 공개 API)에서 시장
+  전체 배당수익률을 한 번에 받아오는 방식(data/krx_data.py)으로 교체함.
 ================================================================================
 """
 import requests
@@ -75,11 +82,19 @@ load_dotenv()
 
 class KISClient:
     """KIS API 클라이언트 - 환경별 자동 선택"""
-    
+
     # 서버 URL
     DEV_BASE_URL = "https://openapivts.koreainvestment.com:29443"  # 모의투자
     PROD_BASE_URL = "https://openapi.koreainvestment.com:9443"     # 실전투자
-    
+
+    # 【2026-08-21】토큰 재사용 주기 (Phase 5-9: main.py 상시루프화)
+    # KIS 토큰 실제 유효기간은 24시간(86400초)이지만, main.py가 이제
+    # systemd 상시 프로세스로 떠서 하루에도 여러 번(스케줄러 체크 루프)
+    # KISClient 메서드를 호출하게 된다 - 매번 새로 토큰을 받으면 불필요한
+    # 재발급이 반복되므로, 22시간(사용자 지정 - 실제 만료 24h보다 2h 여유)
+    # 마다 한 번만 재발급하고 그 사이엔 기존 토큰을 재사용한다.
+    TOKEN_REFRESH_INTERVAL_SECONDS = 22 * 60 * 60
+
     def __init__(self):
         """KIS API 클라이언트 초기화 (환경별 자동 선택)"""
         
@@ -107,7 +122,8 @@ class KISClient:
         self.access_token = None
         self.token_expired = None
         self.last_update = None
-        
+        self.token_issued_at = None  # 【2026-08-21】토큰 재사용 판단용 (ensure_valid_token 참고)
+
         print(f"✅ KIS Client 초기화 완료")
         print(f"   환경: {env_label}")
         print(f"   서버: {self.base_url}")
@@ -154,6 +170,7 @@ class KISClient:
                 self.token_expired = data.get('expires_in')
                 
                 if self.access_token:
+                    self.token_issued_at = datetime.now()
                     print(f"✅ 토큰 발급 완료!")
                     print(f"   유효기간: {self.token_expired}")
                     return True
@@ -174,14 +191,35 @@ class KISClient:
             traceback.print_exc()
             return False
     
+    def ensure_valid_token(self) -> bool:
+        """
+        토큰이 아예 없으면 새로 발급받고, 있으면 마지막 발급 후
+        TOKEN_REFRESH_INTERVAL_SECONDS(22시간)가 지났는지만 확인해서
+        지났을 때만 재발급한다. 그 안에서는 기존 토큰을 그대로 재사용한다.
+
+        【2026-08-21】main.py가 상시 프로세스(systemd)로 바뀌면서, 하루에도
+        여러 번 이 클라이언트의 메서드가 호출된다. 기존의 "토큰이 None일
+        때만 재발급" 방식은 인스턴스 하나를 계속 재사용하는 한 문제없지만,
+        장시간 떠있는 프로세스에서는 22시간마다 능동적으로 갱신해줘야
+        실제 만료(24시간) 전에 항상 유효한 토큰을 유지할 수 있다.
+        """
+        if self.access_token is None or self.token_issued_at is None:
+            return self.get_access_token()
+
+        elapsed = (datetime.now() - self.token_issued_at).total_seconds()
+        if elapsed >= self.TOKEN_REFRESH_INTERVAL_SECONDS:
+            print(f"\n토큰 발급 후 {elapsed / 3600:.1f}시간 경과 - 재발급합니다")
+            return self.get_access_token()
+
+        return True
+
     def get_kospi_kosdaq(self) -> Dict:
         """KOSPI/KOSDAQ 지수 조회 (실제 API)"""
         try:
             print("\nKOSPI/KOSDAQ 조회 중...")
             
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
+            if not self.ensure_valid_token():
+                return {}
             
             # 【정확한 엔드포인트】지수 현재가 API
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-index-price"
@@ -290,9 +328,8 @@ class KISClient:
         try:
             print(f"\n📈 종목 기본분석 지표 조회 중 ({stock_code})...")
 
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
+            if not self.ensure_valid_token():
+                return {}
 
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
 
@@ -361,111 +398,11 @@ class KISClient:
             traceback.print_exc()
             return {}
 
-    def get_dividend_rates(self, market: str, days_back: int = 365) -> Dict[str, float]:
-        """
-        시장 전체 배당률(현금배당 기준) 일괄 조회
-        【Phase 5-8 신규】배당수익률 실제 데이터 연동용
-
-        - API: 국내주식 배당률 상위(순위분석)
-        - tr_id: HHKDB13470100
-        - get_stock_fundamental()과 다르게 "종목 하나"가 아니라 "시장 전체 랭킹"을
-          한 번에 반환하는 API다. 그래서 종목 수만큼이 아니라 시장당 1회(+필요시
-          페이지네이션)만 호출한다.
-
-        Args:
-            market: "KOSPI" 또는 "KOSDAQ"
-            days_back: 조회 기준일(F_DT~T_DT) 범위 - 오늘부터 며칠 전까지의 배당을
-                집계할지 (기본 365일 = 최근 1년 배당 기준, 통상적인 trailing
-                배당수익률 개념과 동일)
-
-        Returns:
-            {"005930": 2.15, "000660": 1.80, ...} 형태의 {종목코드: 배당률(%)} 딕셔너리.
-            조회 실패 시 빈 딕셔너리 (호출부는 병합할 데이터가 없다고 보고 그대로 진행)
-        """
-        market_params = {
-            "KOSPI": {"gb1": "1", "upjong": "0001"},
-            "KOSDAQ": {"gb1": "3", "upjong": "1001"},
-        }
-        if market not in market_params:
-            raise ValueError(f"알 수 없는 시장 구분: {market}")
-
-        try:
-            print(f"\n💰 {market} 배당률 일괄 조회 중...")
-
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
-
-            url = f"{self.base_url}/uapi/domestic-stock/v1/ranking/dividend-rate"
-            t_dt = datetime.now().strftime("%Y%m%d")
-            f_dt = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
-
-            dividend_map: Dict[str, float] = {}
-            cts_area = " "
-            tr_cont = ""
-            max_pages = 10
-
-            for page in range(max_pages):
-                headers = {
-                    "authorization": f"Bearer {self.access_token}",
-                    "appkey": self.api_key,
-                    "appsecret": self.api_secret,
-                    "tr_id": "HHKDB13470100",
-                    "custtype": "P",
-                    "tr_cont": tr_cont,
-                }
-                params = {
-                    "CTS_AREA": cts_area,
-                    "GB1": market_params[market]["gb1"],
-                    "UPJONG": market_params[market]["upjong"],
-                    "GB2": "0",   # 전체 종목선택
-                    "GB3": "2",   # 현금배당
-                    "F_DT": f_dt,
-                    "T_DT": t_dt,
-                    "GB4": "0",   # 전체(결산+중간배당)
-                }
-
-                response = requests.get(
-                    url, headers=headers, params=params, verify=False, timeout=30
-                )
-
-                print(f"   [{page + 1}페이지] 상태 코드: {response.status_code}")
-
-                if response.status_code != 200:
-                    print(f"   ❌ 조회 실패! {response.status_code}")
-                    break
-
-                data = response.json()
-                if data.get('rt_cd', '0') != '0':
-                    print(f"   ❌ API 오류: {data.get('msg1', '')}")
-                    break
-
-                for row in data.get('output', []):
-                    symbol = str(row.get('sht_cd', '')).strip()
-                    rate = row.get('divi_rate')
-                    if not symbol or rate in (None, ''):
-                        continue
-                    try:
-                        dividend_map[symbol] = float(rate)
-                    except (TypeError, ValueError):
-                        continue
-
-                # 다음 페이지 여부 - 응답 헤더 tr_cont가 "M"이면 더 있음
-                # (CTS_AREA는 공식 레퍼런스와 동일하게 그대로 유지, tr_cont만 갱신)
-                if response.headers.get('tr_cont') == "M":
-                    tr_cont = "N"
-                    time.sleep(0.2)
-                    continue
-                break
-
-            print(f"   ✅ {market} 배당률 {len(dividend_map)}종목 확보")
-            return dividend_map
-
-        except Exception as e:
-            print(f"❌ {market} 배당률 일괄 조회 오류: {e}")
-            import traceback
-            traceback.print_exc()
-            return {}
+    # get_dividend_rates()는 여기 있었으나 제거됨 - 실측 결과 부적합한 API였음
+    # (시장당 20종목까지만 반환하는 랭킹 API였고, 필드도 배당수익률이 아니라
+    # 액면배당률이었음). 배당수익률은 이제 data/krx_data.py(KRX 정보데이터시스템,
+    # KIS와 무관한 별도 공개 API)에서 조회한다. 자세한 경위는 파일 상단 변경
+    # 이력의 【2026-08-17】 항목 참고.
 
     def get_daily_price(self, stock_code: str, days: int = 60) -> Dict:
         """
@@ -482,9 +419,8 @@ class KISClient:
         try:
             print(f"\n📊 일별 시세 데이터 조회 중 ({stock_code}, {days}일)...")
             
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
+            if not self.ensure_valid_token():
+                return {}
             
             # 데이터 저장소
             all_data = {
@@ -676,9 +612,8 @@ class KISClient:
         try:
             print(f"\n당일 분봉 데이터 조회 중 ({stock_code})...")
             
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
+            if not self.ensure_valid_token():
+                return {}
             
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-intraday-itemchartprice"
             
@@ -742,9 +677,8 @@ class KISClient:
         try:
             print(f"\n일별 분봉 데이터 조회 중 ({stock_code}, {days}일)...")
             
-            if not self.access_token:
-                if not self.get_access_token():
-                    return {}
+            if not self.ensure_valid_token():
+                return {}
             
             return self.get_daily_price(stock_code, days)
                 

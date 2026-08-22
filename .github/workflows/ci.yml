@@ -1,29 +1,23 @@
 name: CI/CD Pipeline
-
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
-
 jobs:
   test:
     name: Test and Lint
     runs-on: ubuntu-latest
-    
     strategy:
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.14']
-    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-    
     - name: Cache pip packages
       uses: actions/cache@v4
       with:
@@ -31,28 +25,23 @@ jobs:
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
-    
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
     - name: Run pytest
       run: |
         pytest tests/ -v --tb=short
-    
     - name: Generate coverage report
       run: |
         pip install pytest-cov
         pytest tests/ --cov=market_intelligence --cov-report=xml
-    
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
         file: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
-    
     - name: Lint with flake8
       run: |
         pip install flake8
@@ -61,31 +50,34 @@ jobs:
         # exit-zero treats all errors as warnings
         flake8 market_intelligence tests --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       continue-on-error: true
-
   build:
     name: Build and Package
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.14'
-    
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
     - name: Run final validation
       run: |
-        python main.py
-    
+        # 【2026-08-21 수정】예전엔 여기서 `python main.py`를 그대로 실행했는데,
+        # main.py가 이제 실제 KIS API + RDS(stock_valuation 테이블)를 필요로
+        # 하는 종목별 분석 스크립트로 바뀌면서, RDS 접속 정보가 없는 이
+        # CI 러너(로컬 SQLite로 폴백, 테이블 자체가 없음)에서는 항상
+        # "no such table: stock_valuation"로 실패하게 됐다. 라이브 데이터가
+        # 필요한 통합 검증은 CI가 아니라 실제 서버(EC2)/사용자 컴퓨터에서
+        # 해야 하므로, 여기서는 import가 되는지(문법 오류/의존성 누락 없는지)
+        # 만 가볍게 확인한다 - main()/run_forever()는 호출하지 않는다
+        # (if __name__ == "__main__" 가드 덕분에 import만으로는 실행 안 됨).
+        python -c "import main; print('main.py import OK')"
     - name: Create artifact
       run: |
         mkdir -p artifacts
@@ -94,14 +86,12 @@ jobs:
         cp main.py artifacts/
         cp requirements.txt artifacts/
         tar -czf trading-mie-v2-build.tar.gz artifacts/
-    
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: trading-mie-v2-build
         path: trading-mie-v2-build.tar.gz
         retention-days: 30
-    
     - name: Create release notes
       run: |
         echo "# MIE V2.0 Build $(date +%Y%m%d-%H%M%S)" > RELEASE_NOTES.md
@@ -110,50 +100,42 @@ jobs:
         echo "- Build Date: $(date)" >> RELEASE_NOTES.md
         echo "- Git Commit: ${{ github.sha }}" >> RELEASE_NOTES.md
         echo "## Test Results" >> RELEASE_NOTES.md
-        echo "- All tests passed ✅" >> RELEASE_NOTES.md
-    
+        echo "- All tests passed" >> RELEASE_NOTES.md
     - name: Upload release notes
       uses: actions/upload-artifact@v4
       with:
         name: release-notes
         path: RELEASE_NOTES.md
-
   security:
     name: Security Check
     runs-on: ubuntu-latest
-    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.14'
-    
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install bandit safety
-    
     - name: Run security scan
       run: |
         bandit -r market_intelligence -f json -o bandit-report.json || true
         safety check --json || true
       continue-on-error: true
-
   notify:
     name: Notify Status
     needs: [test, build, security]
     runs-on: ubuntu-latest
     if: always()
-    
     steps:
     - name: Check job status
       run: |
         if [ "${{ needs.test.result }}" == "success" ]; then
-          echo "✅ All tests passed!"
+          echo "All tests passed!"
         else
-          echo "❌ Tests failed!"
+          echo "Tests failed!"
           exit 1
         fi

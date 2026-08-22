@@ -1,0 +1,30 @@
+[Unit]
+Description=MIE V2.0 Automated Trading System
+After=network.target syslog.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+# Python 가상 환경의 python으로 상시 서비스 모드(serve) 실행
+# 【2026-08-21 수정】예전엔 인자 없이 main.py를 실행했는데, main.py가
+# "1회 실행 후 종료"하는 스크립트라서 Restart=always/RestartSec=10과
+# 만나 몇 초마다 재시작을 반복하다가 StartLimitBurst(3회/60초)에
+# 걸려 완전히 죽어버렸다(8/7부터 계속 dead 상태였음). main.py에 이제
+# 상시 서비스 모드(serve)가 추가됐으므로 그걸 실행하도록 변경 -
+# serve 모드는 정상적으로는 종료하지 않고 계속 떠있으므로, 아래
+# Restart=always는 이제 "진짜 죽었을 때"(처리되지 않은 크래시 등)를
+# 위한 안전장치로만 동작한다.
+ExecStart=/opt/mie-v2/venv/bin/python main.py serve
+# 자동 재시작 설정 (진짜 크래시했을 때의 안전장치)
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+# 로그 설정
+StandardOutput=append:/var/log/mie-v2/output.log
+StandardError=append:/var/log/mie-v2/error.log
+# 환경 변수
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+[Install]
+WantedBy=multi-user.target
