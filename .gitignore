@@ -229,3 +229,6 @@ data/master_cache/
 data/valuation_cache/
 __pycache__/
 *.pyc
+
+# 상시 서비스(serve) 실행 상태 - 서버마다 다른 로컬 진행 기록이라 커밋 대상 아님
+data/state/
