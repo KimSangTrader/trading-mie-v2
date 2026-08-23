@@ -5,7 +5,7 @@ SQLAlchemy ORM Models for MIE V2.0
 
 from sqlalchemy import (
     Column, Integer, String, Float, BigInteger, DateTime, Text,
-    Numeric, Index, create_engine, VARCHAR, DECIMAL
+    Numeric, Index, create_engine, VARCHAR, DECIMAL, Boolean
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -264,6 +264,69 @@ class StockValuation(Base):
 
     def __repr__(self):
         return f"<StockValuation(ticker={self.ticker}, market={self.market}, per={self.per}, valuation_score={self.valuation_score})>"
+
+# ==========================================
+# 10. 종목별 Sector/Theme 매핑 테이블 (Phase 5-12)
+# ==========================================
+class StockSectorMapping(Base):
+    """종목별 Analysis_Sector 매핑 - 사용자가 1차로 분류해 엑셀(전체종목_매핑 시트)로
+    전달한 결과를 그대로 저장한다.
+
+    stock_valuation과 동일한 "배치(timestamp)" 패턴 - 사용자가 분류를 다시 정리해서
+    새 엑셀을 주면 새 timestamp로 통째로 다시 insert하고, 분석은 항상 최신 배치
+    (MAX(timestamp))만 사용한다. 과거 배치는 지우지 않고 이력으로 남긴다.
+    """
+    __tablename__ = "stock_sector_mapping"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    ticker = Column(String(10), nullable=False)
+    name = Column(String(50))
+    market = Column(String(10))       # 정규화된 값: 'KOSPI', 'KOSDAQ', 'KONEX'
+    market_raw = Column(String(10))   # 엑셀 원본 라벨: '유가', '코스닥', '코넥스'
+    krx_industry = Column(String(100))  # KRX_원본업종
+    main_products = Column(Text)        # 주요제품
+    sector = Column(String(50), nullable=False)  # Analysis_Sector
+    needs_review = Column(Boolean, default=False)  # 검토필요여부
+    sector_method = Column(String(50))   # Sector_판정방식
+    theme_method = Column(String(100))   # Theme_판정방식
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_stock_sector_mapping_timestamp', 'timestamp'),
+        Index('idx_stock_sector_mapping_ticker', 'ticker'),
+        Index('idx_stock_sector_mapping_sector', 'sector'),
+    )
+
+    def __repr__(self):
+        return f"<StockSectorMapping(ticker={self.ticker}, sector={self.sector}, market={self.market})>"
+
+
+class StockThemeMapping(Base):
+    """종목별 Theme 매핑 - 종목 1개가 여러 테마에 속할 수 있어(Primary + Secondary)
+    stock_sector_mapping과 별도로 다대다(종목:테마) 형태로 저장한다.
+
+    is_primary=True면 엑셀의 Primary_Theme, False면 Secondary_Themes(콤마로 구분된
+    여러 값을 각각 한 행씩 분리)에서 온 것이다. batch는 timestamp로
+    stock_sector_mapping과 동일하게 맞춘다(같은 임포트 실행에서 나온 값).
+    """
+    __tablename__ = "stock_theme_mapping"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    ticker = Column(String(10), nullable=False)
+    theme = Column(String(50), nullable=False)
+    is_primary = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_stock_theme_mapping_timestamp', 'timestamp'),
+        Index('idx_stock_theme_mapping_ticker', 'ticker'),
+        Index('idx_stock_theme_mapping_theme', 'theme'),
+    )
+
+    def __repr__(self):
+        return f"<StockThemeMapping(ticker={self.ticker}, theme={self.theme}, is_primary={self.is_primary})>"
 
 # ==========================================
 # Database Session 관리

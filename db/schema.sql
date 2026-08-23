@@ -171,6 +171,41 @@ CREATE INDEX idx_stock_valuation_timestamp ON stock_valuation(timestamp DESC);
 CREATE INDEX idx_stock_valuation_ticker ON stock_valuation(ticker);
 CREATE INDEX idx_stock_valuation_market ON stock_valuation(market);
 
+-- 10. 종목별 Sector 매핑 테이블 (Phase 5-12) - 사용자가 1차 분류한 엑셀 원본
+CREATE TABLE IF NOT EXISTS stock_sector_mapping (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- 임포트 배치 시각
+    ticker VARCHAR(10) NOT NULL,
+    name VARCHAR(50),
+    market VARCHAR(10),       -- 정규화: 'KOSPI', 'KOSDAQ', 'KONEX'
+    market_raw VARCHAR(10),   -- 엑셀 원본 라벨: '유가', '코스닥', '코넥스'
+    krx_industry VARCHAR(100),
+    main_products TEXT,
+    sector VARCHAR(50) NOT NULL,
+    needs_review BOOLEAN DEFAULT FALSE,
+    sector_method VARCHAR(50),
+    theme_method VARCHAR(100),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_stock_sector_mapping_timestamp ON stock_sector_mapping(timestamp DESC);
+CREATE INDEX idx_stock_sector_mapping_ticker ON stock_sector_mapping(ticker);
+CREATE INDEX idx_stock_sector_mapping_sector ON stock_sector_mapping(sector);
+
+-- 11. 종목별 Theme 매핑 테이블 (Phase 5-12) - 종목:테마 다대다(Primary + Secondary)
+CREATE TABLE IF NOT EXISTS stock_theme_mapping (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- stock_sector_mapping과 동일 배치
+    ticker VARCHAR(10) NOT NULL,
+    theme VARCHAR(50) NOT NULL,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_stock_theme_mapping_timestamp ON stock_theme_mapping(timestamp DESC);
+CREATE INDEX idx_stock_theme_mapping_ticker ON stock_theme_mapping(ticker);
+CREATE INDEX idx_stock_theme_mapping_theme ON stock_theme_mapping(theme);
+
 -- ==========================================
 -- 권한 설정
 -- ==========================================
@@ -190,3 +225,5 @@ COMMENT ON TABLE analysis_results IS '7개 분석기 종합 점수 및 추천';
 COMMENT ON TABLE trading_history IS '자동매매 거래 기록 (향후)';
 COMMENT ON TABLE system_status IS '시스템 상태 모니터링';
 COMMENT ON TABLE stock_valuation IS '종목별 PER/PBR/배당수익률 및 시장(KOSPI/KOSDAQ) 상대평가 결과';
+COMMENT ON TABLE stock_sector_mapping IS '종목별 Analysis_Sector 매핑 (사용자 1차 분류 엑셀 원본)';
+COMMENT ON TABLE stock_theme_mapping IS '종목별 Theme 매핑 (Primary/Secondary, 다대다)';
