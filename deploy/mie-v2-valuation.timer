@@ -1,0 +1,14 @@
+[Unit]
+Description=MIE V2.0 - 전종목 밸류에이션 수집 매일 1회 실행 (평일 18:00 KST)
+
+[Timer]
+# 평일(월~금, KST 기준) 18:00에 mie-v2-valuation.service를 1회 실행한다.
+# main.py serve의 일마감 분석(19:00 KST)보다 1시간 앞서 실행 - 전종목 수집
+# 실측 소요시간(약 27~28분, 2026-08-24 기준)에 여유를 충분히 둔 시각이다.
+# 【타임존 주의】mie-v2-krx-import.timer와 동일한 이유로 Asia/Seoul 명시.
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Seoul
+Persistent=true
+Unit=mie-v2-valuation.service
+
+[Install]
+WantedBy=timers.target

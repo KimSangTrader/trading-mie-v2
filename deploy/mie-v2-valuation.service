@@ -1,0 +1,21 @@
+[Unit]
+Description=MIE V2.0 - 전종목 PER/PBR/배당 밸류에이션 수집 (RDS stock_valuation 갱신)
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+# KOSPI/KOSDAQ 전체(2,718종목) PER/PBR(KIS API)+배당수익률(data/krx/latest/,
+# mie-v2-krx-import.timer가 미리 채워둔 값) + Sector 중앙값을 계산해 RDS의
+# stock_valuation 테이블에 저장한다. main.py serve(일마감 분석, 평일 19:00 KST)가
+# 이 테이블을 "읽기만" 하므로, 반드시 19:00 이전에 끝나야 한다 - 실측 전종목
+# 소요시간 약 27~28분(2026-08-24 기준)이라 mie-v2-valuation.timer를 18:00 KST로
+# 잡아 충분한 여유(약 1시간)를 둔다.
+ExecStart=/opt/mie-v2/venv/bin/python -m market_intelligence.collectors.valuation_pipeline all
+StandardOutput=append:/var/log/mie-v2/valuation.log
+StandardError=append:/var/log/mie-v2/valuation.log
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 전종목 수집이라 시간이 걸린다 - 기본 90초 타임아웃 대신 넉넉히 잡아둔다
+# (systemd가 "멈춘 프로세스"로 오판해 죽이는 것을 방지, 실제로는 30분 내외면 끝남).
+TimeoutStartSec=3600

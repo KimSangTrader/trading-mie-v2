@@ -1,0 +1,16 @@
+[Unit]
+Description=MIE V2.0 - KRX CSV 임포트 스캔 (incoming/ -> latest/)
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+# data/krx/incoming/에 사람이 수동으로 올려둔 KRX CSV(PER/PBR/배당수익률)를
+# 스캔해서 검증 후 data/krx/latest/에 반영한다. incoming/이 비어있으면 아무
+# 일도 안 하고 즉시 끝나는 가벼운 스캔이라, 짧은 주기로 반복 실행해도 부담 없음
+# (mie-v2-krx-import.timer가 15분 간격으로 이 서비스를 트리거한다).
+ExecStart=/opt/mie-v2/venv/bin/python -m data.krx_importer
+StandardOutput=append:/var/log/mie-v2/krx_import.log
+StandardError=append:/var/log/mie-v2/krx_import.log
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

@@ -1,0 +1,21 @@
+[Unit]
+Description=MIE V2.0 - KRX CSV 임포트 스캔 주기 실행 (평일 15분 간격)
+
+[Timer]
+# 평일(월~금, KST 기준)에 한해 15분 간격으로 mie-v2-krx-import.service를
+# 실행한다. 시각을 좁은 창(예: 15:00~19:00 KST)으로 제한하지 않고 하루 종일
+# 도는 이유: incoming/이 비어있으면 즉시 끝나는 가벼운 스캔이라 부담이 없고,
+# 사람이 CSV를 언제 올리든(장 마감 직후든 늦은 저녁이든) 최대 15분 안에 자동
+# 반영되게 하기 위함.
+# 【타임존 주의】서버의 시스템 타임존이 UTC인지 KST인지 알 수 없어(main.py의
+# run_forever()도 이 문제 때문에 datetime.now(KST)로 코드 안에서 직접 변환
+# 한다), 여기서는 systemd OnCalendar가 지원하는 타임존 지정 문법(값 끝에
+# "Asia/Seoul" 명시, systemd 239+)을 써서 서버 기본 타임존과 무관하게 항상
+# KST 기준으로 평가되게 했다. 요일(월~금) 판정도 KST 기준으로 맞아야 하므로
+# 필수.
+OnCalendar=Mon..Fri *-*-* *:0/15:00 Asia/Seoul
+Persistent=true
+Unit=mie-v2-krx-import.service
+
+[Install]
+WantedBy=timers.target
