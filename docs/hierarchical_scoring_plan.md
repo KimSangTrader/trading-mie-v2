@@ -466,7 +466,59 @@ SQLite 단위테스트 + 코드 리뷰로만 검증했다(이 프로젝트의 �
   (3) 18:00 KST 이후 `/var/log/mie-v2/valuation.log`에서 전종목 수집이
   정상 완료됐는지, RDS `stock_valuation` 테이블의 배당수익률 컬럼이 그날
   갱신됐는지 확인.
-- **Phase 5-21 구현 완료, EC2 설치·라이브 검증 대기 중.**
+- **검증 완료(2026-08-24, 사용자 EC2에서 직접)**: 설치 명령 실행 →
+  `mie-v2-krx-import.timer`/`mie-v2-valuation.timer` 둘 다 enable 성공,
+  `systemctl list-timers`로 다음 실행 예정 시각이 KST 기준(각각 15분 후,
+  익일 18:00)으로 정확히 나오는 것 확인 - 서버 시스템 타임존이 실제로
+  UTC임에도 `Asia/Seoul` 명시 덕에 KST로 정확히 스케줄링됨을 확인. 15분 뒤
+  krx-import 타이머가 실행되어 `/var/log/mie-v2/krx_import.log`에
+  "incoming/ 폴더에 처리할 CSV가 없습니다"가 에러 없이 찍힘(당시 incoming/이
+  실제로 비어있었으므로 정상 동작).
+- **Phase 5-21 완전히 종료(설치·기본 동작 검증까지 끝남). 실제 CSV
+  임포트/밸류에이션 수집 성공 여부는 Phase 5-22(아래) 이후 실데이터로 다시
+  확인.**
+
+### Phase 5-22 — 로컬(Windows) → EC2 CSV 자동 전송 (scp 자동화) [2026-08-24]
+- 배경: Phase 5-21 검증 중 사용자가 KRX CSV를 `C:\Projects\trading-mie-v2\
+  data\krx\incoming`(Windows 로컬 저장소 폴더)에 넣었는데 EC2가 못 찾는
+  문제가 발생. 원인은 EC2와 Windows가 완전히 별개의 파일시스템이라는 것 -
+  `git push`는 소스 코드만 옮기고 데이터 파일(`data/krx/`)은 안 옮기므로,
+  CSV를 실제로 importer가 도는 EC2의 `/opt/mie-v2/data/krx/incoming/`에
+  직접 갖다 놔야 한다. 예전(Phase 5-8)엔 사람이 수동 실행하는 컴퓨터가
+  Windows였으니 문제가 없었지만, Phase 5-21로 importer가 EC2로 옮겨가면서
+  "다운로드한 파일을 EC2까지 옮기는" 한 단계가 새로 필요해짐. 사용자가
+  "로컬 PC에 미리 넣어두면 자동으로 EC2까지 가져가서 쓰게" 자동화를 요청.
+- 설계: KRX 사이트에서의 다운로드 자체는 여전히 사람이 해야 한다(안티봇
+  조치로 자동화 불가 - Phase 5-8 결정 그대로 유지). 그 다음 "로컬 →
+  EC2 전송"만 자동화한다.
+  1. `scripts/windows/sync_krx_to_ec2.ps1` - 로컬 `data/krx/incoming/`에서
+     파일명에 kospi/kosdaq이 들어간 `.csv` 중 최종 수정 후 30초 이상 지난
+     파일(다운로드 도중인 파일을 잘못 집지 않기 위한 안전장치)을 찾아
+     `scp`로 EC2의 `/opt/mie-v2/data/krx/incoming/`에 전송하고, 성공한
+     파일은 로컬 `data/krx/incoming/_sent/`로 옮겨 중복 전송을 막는다.
+     실패하면 파일을 그대로 둬서 다음 실행 때 재시도된다. 모든 시도를
+     `logs/krx_sync.log`에 기록.
+  2. `scripts/windows/register_krx_sync_task.ps1` - 위 스크립트를 Windows
+     작업 스케줄러에 평일 15:00~20:00, 10분 간격 반복 작업으로 1회 등록하는
+     헬퍼(관리자 권한 PowerShell에서 1회 실행). EC2의
+     `mie-v2-valuation.timer`(18:00 KST)보다 여유있게 앞뒤로 걸치는 창.
+  3. `sync_krx_to_ec2.ps1` 상단의 `Ec2Host`/`SshKeyPath`는 자리표시자
+     (`REPLACE_ME`)로 커밋함 - 사용자 개인 SSH 키 경로/EC2 주소는 이
+     세션이 알 수 없고 민감정보라 실제 값은 사용자가 직접 채워 넣어야 함.
+- **한계(사용자에게 명시적으로 안내 필요)**: 이 자동화는 EC2의 systemd
+  타이머와 달리 **Windows PC가 그 시간대에 켜져 있고 로그온돼 있어야만**
+  동작한다. 다만 KRX 다운로드 자체가 애초에 사람이 그 시간대에 PC를 쓰고
+  있어야 하는 작업이라, 이 제약이 워크플로에 새로운 제약을 추가하는 건
+  아니다 - 단지 "옮긴 뒤 수동으로 scp 명령 치기"를 없애주는 정도.
+- 검증 필요(이 세션은 사용자 컴퓨터에서 실행할 수 없음 - SSH 키 등록,
+  Windows PowerShell 실행 정책 등 사용자 환경 의존): (1)
+  `sync_krx_to_ec2.ps1` 상단 설정값을 실제 값으로 채운 뒤 CSV 1개로 수동
+  실행(`powershell -File sync_krx_to_ec2.ps1`)해서 EC2로 정상 전송되고
+  `_sent/`로 이동하는지, (2) `register_krx_sync_task.ps1`로 작업 스케줄러
+  등록 후 `Start-ScheduledTask`로 1회 강제 실행해 같은 결과가 나오는지,
+  (3) EC2 쪽 `mie-v2-krx-import.timer`가 15분 내에 `krx_import.log`에
+  실제 반영 로그를 남기는지.
+- **Phase 5-22 구현 완료, 사용자 환경 설정 및 라이브 검증 대기 중.**
 
 ## 4. 리스크 / 미확정 사항
 - Sector별 PER 중앙값 계산 → **Phase 5-19 완전히 종료(2026-08-24)** -
