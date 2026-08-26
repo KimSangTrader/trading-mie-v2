@@ -510,15 +510,115 @@ SQLite 단위테스트 + 코드 리뷰로만 검증했다(이 프로젝트의 �
   동작한다. 다만 KRX 다운로드 자체가 애초에 사람이 그 시간대에 PC를 쓰고
   있어야 하는 작업이라, 이 제약이 워크플로에 새로운 제약을 추가하는 건
   아니다 - 단지 "옮긴 뒤 수동으로 scp 명령 치기"를 없애주는 정도.
-- 검증 필요(이 세션은 사용자 컴퓨터에서 실행할 수 없음 - SSH 키 등록,
-  Windows PowerShell 실행 정책 등 사용자 환경 의존): (1)
-  `sync_krx_to_ec2.ps1` 상단 설정값을 실제 값으로 채운 뒤 CSV 1개로 수동
-  실행(`powershell -File sync_krx_to_ec2.ps1`)해서 EC2로 정상 전송되고
-  `_sent/`로 이동하는지, (2) `register_krx_sync_task.ps1`로 작업 스케줄러
-  등록 후 `Start-ScheduledTask`로 1회 강제 실행해 같은 결과가 나오는지,
-  (3) EC2 쪽 `mie-v2-krx-import.timer`가 15분 내에 `krx_import.log`에
-  실제 반영 로그를 남기는지.
-- **Phase 5-22 구현 완료, 사용자 환경 설정 및 라이브 검증 대기 중.**
+- **검증 완료(2026-08-25, 사용자 컴퓨터+EC2 실제 파일로)**: 첫 실행 시
+  설정값이 자리표시자(`REPLACE_ME`)인 채로 실행해 스크립트가 의도대로
+  안전하게 중단됨을 먼저 확인(부수적으로 Windows PowerShell이 BOM 없는
+  UTF-8 스크립트를 콘솔에 표시할 때 한글이 깨지는 문제를 발견해 두 스크립트
+  파일에 UTF-8 BOM을 추가해 재전달·수정함). `$Ec2Host`/`$SshKeyPath`를
+  실제 값으로 채운 뒤 재실행 → `kosdaq_20260824.csv`/`kospi_20260824.csv`
+  둘 다 scp 전송 성공(각각 132KB/69KB, 정상 전송 속도) 및 로컬 `_sent/`로
+  이동 확인. 이후 EC2에서 `mie-v2-krx-import.timer`가 15분 내에 자동
+  반영해, `data/krx/latest/{kospi,kosdaq}.json`의 `trade_date`가 둘 다
+  `20260824`로 정상 갱신됨을 확인 - **로컬 다운로드 → Windows→EC2 자동
+  전송 → EC2 자동 임포트까지 전체 파이프라인이 실제 파일로 처음 끝까지
+  성공했다.** 이 서버가 배당수익률 데이터를 실제로 갖게 된 첫 사례.
+- 남은 확인: (1) `register_krx_sync_task.ps1`로 작업 스케줄러 등록해
+  향후 수동 실행 없이도 반복되는지, (2) 다음 `mie-v2-valuation.timer`
+  실행(평일 18:00 KST) 때 `/var/log/mie-v2/valuation.log`가 정상
+  완료되고 RDS `stock_valuation`의 배당수익률 컬럼이 실제로 채워지는지.
+- **Phase 5-22 완전히 종료 - 로컬→EC2 CSV 전송, EC2 자동 임포트까지
+  실데이터로 라이브 검증 끝남. 밸류에이션 수집(18:00 KST 배치) 자체의
+  라이브 검증만 남음.**
+
+### Phase 6-1 — 매매 실행 엔진 순수 계산기 (Turtle Hybrid) [2026-08-25]
+- 배경: 사용자가 "MIE V2 중간감리보고서"(외부 검토 문서)를 업로드해 분석
+  요청 → 검토 결과 상당수 항목(수급 연동/Sector 밸류에이션/EC2 자동화)이
+  이미 완료된 상태임을 코드 재확인으로 교차검증해서 알려줌(README
+  테스트수 불일치, 레거시 analyzer 3개 잔존, `.env`가 배포 ZIP에 포함된
+  보안 문제는 실제로 아직 유효함을 확인). 이어서 사용자가 "급하지 않은
+  건 나중에 보강하고, 실제 매매 프로그램을 진행하자"고 지시 - Phase
+  5-10에서 이미 예고했던 "②실시간 매매/실주문 프로세스"(당시엔 범위 밖으로
+  미룸)를 시작하는 것.
+- AskUserQuestion으로 확정: (1) KIS 모의투자(KIS_DEV)로 먼저 검증, 실전
+  전환은 나중, (2) 주문 실행은 완전 자동(사람 승인 없이 시스템이 직접
+  매수/매도), (3) 계층형 랭킹 상위 30종목을 후보 풀로 삼음, (4) 리밸런싱은
+  매일(기존 19:00 KST 일마감 분석과 자연스럽게 이어짐). "매도 기준"
+  질문에는 "특이사항 없음"으로 답함.
+- 그 직후 사용자가 `miev2trading.txt`(매매기준/1회 매매한도를 정리한
+  업로드 문서, Turtle Trading 하이브리드 실행 엔진 설계)를 제공하며 "참조해서
+  진행"을 지시 - 이 문서의 규칙/숫자를 그대로 코드로 옮겼다(이 세션이 임의로
+  정한 값이 하나도 없음).
+- 구현: `market_intelligence/trade_execution/` 신규 패키지(analyzers/와
+  동일한 원칙 - 순수 계산기, API/DB 호출 없음). 7개 모듈:
+  1. `config.py` - `TradingConfig`(불변 dataclass): TOTAL_CAPITAL 700만원
+     (문서 예시값, 실전 배선 시 KIS 잔고조회로 대체 예정), 현금예비 10%,
+     종목당 위험 0.5%(35,000원), 포트폴리오 전체 위험 5%(350,000원),
+     종목당 최대투자 15%(1,050,000원), 최대보유 7종목, Sector/Theme당
+     최대 2종목, 최대분할매수 3회, 진입비중 50/25/25%, 손절 2×ATR20,
+     피라미딩 트리거 +1×ATR20, 진입점수 기준(final≥75/sector≥65/
+     theme≥60), 추가매수 랭킹 유지 기준(≤30위). `GAP_BANDS` 5단계 갭
+     판정표(문서 §4 원문 그대로: ≤-5% WAIT / -5~+3% NORMAL_ENTRY / +3~+7%
+     WAIT_CONFIRMATION / +7~+12% REDUCE_POSITION / +12%+ NO_ENTRY).
+  2. `atr.py` - 20일 ATR(단순이동평균 방식 채택 - 문서가 평활 방식을
+     명시 안 해서, Wilder 지수평활 대신 더 투명한 단순 이동평균을 선택함을
+     명시적으로 남김. 필요하면 나중에 교체 가능하게 함수 분리).
+  3. `gap_filter.py` - 시초가 갭(%) 계산 + 5단계 판정.
+  4. `entry_filter.py` - 1차 진입 재검증(갭 판정 최우선 → final/sector/
+     theme 점수 → ATR 유효성 순으로 차단, `BUY`/`REDUCE`/`WAIT`/`NO_ENTRY`).
+  5. `diversification.py` - Sector/Theme 집중도 제한 그리디 선정
+     (`diversify_candidates()`, 문서 §6 코드 그대로). 매핑 안 된 종목은
+     결측을 이유로 부당 탈락시키지 않음(기존 프로젝트 원칙과 동일 정신).
+  6. `position_sizer.py` - `calculate_position()`(위험기준/투자한도기준/
+     가용현금기준 중 최솟값으로 목표수량 산출) + `split_entry_shares()`
+     (목표수량을 1·2·3차 비중으로 분할, 책임 분리).
+  7. `pyramiding.py` - `should_add()`(물타기 금지 - 평균단가 이하면 무조건
+     차단, +1ATR 도달 + 랭킹≤30 + Sector/Theme 점수 유지를 전부 AND로
+     요구) + `check_stop()`(손절가 도달 여부만 - 아래 미확정 사항 참고).
+  8. `portfolio_risk.py` - 보유 포지션 전체의 위험 합계, 남은 위험 한도,
+     신규/추가매수 수량을 포트폴리오 한도로 재차 클리핑.
+- **문서 자체의 계산 오류 1건 발견·수정 없이 그대로 보고**: §11의 7종목
+  예시표 중 E종목(진입가 30,000원/ATR20 800원)이 14주로 적혀 있는데,
+  이는 문서가 명시한 공식(2×ATR 손절, `floor(35,000/risk_per_share)`)과
+  안 맞는다 - 공식대로면 21주가 맞고, 나머지 6종목(A/B/C/D/F/G)은 전부
+  공식과 정확히 일치한다. 표의 14주가 되려면 risk_per_share=2,400
+  (=3×ATR)이어야 해서 다른 6종목의 배수(2×ATR)와도 어긋난다 - 단순
+  오탈자로 판단, 구현은 문서가 명시한 공식(2×ATR)을 그대로 따랐다
+  (표의 오기를 따라가지 않음). `tests/test_position_sizer.py`에 이 판단
+  근거를 그대로 남겨둠.
+- **검증 완료(이 세션에서 직접 실행 가능 - DB/API 의존이 전혀 없는 순수
+  계산기라서)**: `tests/test_atr.py`, `test_gap_filter.py`,
+  `test_entry_filter.py`, `test_diversification.py`,
+  `test_position_sizer.py`, `test_pyramiding.py`, `test_portfolio_risk.py`
+  총 73개 전부 통과(`pytest tests/test_atr.py tests/test_gap_filter.py
+  tests/test_entry_filter.py tests/test_diversification.py
+  tests/test_position_sizer.py tests/test_pyramiding.py
+  tests/test_portfolio_risk.py` → `73 passed`). 문서에 나온 계산 예시
+  (A/B/C/D/F/G 7종목 중 6개, 700만원 계좌 위험 350,000원, 7종목 위험합계
+  242,000원/잔여 108,000원, AI테마 4종목 중 4위 제외 예시 등)를 픽스처로
+  그대로 써서 구현이 문서 수치와 정확히 일치함을 확인했다. 9개 신규 파일
+  전부 `ast.parse()` 문법 확인도 완료.
+- **미확정 - 다음 단계에서 반드시 확인 필요**: 문서는 진입/피라미딩/손절
+  규칙은 정확한 수치까지 줬지만, "손절가 도달 이외의 이유로 포지션을
+  전량 청산하는 규칙"(문서의 `ExitManager`, "추세 이탈 시 전량/단계적
+  청산")은 모듈 이름만 언급하고 정확한 수치 규칙을 안 줬다. 이 세션이
+  임의로 수치를 만들지 않았다 - `pyramiding.check_stop()`은 손절가 도달
+  여부만 확인하고, 그 외에는 계속 보유한다. 다음 단계 전에 사용자에게
+  다시 확인 필요(예: 랭킹이 며칠 연속 크게 나빠지면 손절가 전이라도
+  전량 매도할지, 한다면 몇 위/며칠 기준으로 할지).
+- **아직 안 한 것(다음 단계)**: (1) `data/kis_client.py`에 실제 주문
+  API(매수/매도/잔고조회/미체결조회) 추가 - 지금은 시세 조회 메서드만
+  있고 주문 관련 메서드가 전혀 없음(이번에 확인함). (2) `db/models.py`에
+  포지션 추적용 테이블 추가(기존 `TradingHistory`는 Phase 5 이전부터 있던
+  개별 거래 기록용 스키마라 재활용 가능하지만 "현재 보유 포지션"을 추적할
+  테이블은 별도로 필요 - 새 테이블이라 `migrate_add_*` 없이
+  `create_tables.py`로 충분). (3) 이 7개 순수 계산기를 KIS API/DB와
+  엮는 `trade_execution_pipeline.py`(analyzers를 valuation_pipeline.py가
+  엮는 것과 같은 역할) + 매일 아침 실행할 systemd 서비스/타이머
+  (완전자동 결정에 따라 09:00~09:30 KST 장 시작 직후 실행 예정). (4) 위
+  ExitManager 수치 규칙 확정. (5) 모의투자 계좌로 실제 라이브 검증(사용자
+  환경에서만 가능, 기존 관례와 동일).
+- **Phase 6-1 부분 완료 - 순수 계산기 7개 + 테스트 73개는 구현·검증 완료.
+  실제 주문 실행(KIS API 연동/DB/파이프라인/systemd 배선)은 다음 단계.**
 
 ## 4. 리스크 / 미확정 사항
 - Sector별 PER 중앙값 계산 → **Phase 5-19 완전히 종료(2026-08-24)** -
