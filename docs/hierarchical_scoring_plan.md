@@ -620,6 +620,84 @@ SQLite 단위테스트 + 코드 리뷰로만 검증했다(이 프로젝트의 �
 - **Phase 6-1 부분 완료 - 순수 계산기 7개 + 테스트 73개는 구현·검증 완료.
   실제 주문 실행(KIS API 연동/DB/파이프라인/systemd 배선)은 다음 단계.**
 
+### Phase 6-2 — 청산(Exit) 엔진: 손절/긴급청산/부분익절/트레일링/터틀청산 [2026-08-26]
+- 배경: Phase 6-1에서 "미확정 - 다음 단계에서 반드시 확인 필요"로 남겨뒀던
+  전량청산 규칙을, 사용자가 두 번째 문서 `miev2tradingsell.txt`를 업로드하며
+  "문서를 확인해서 손절 및 익절, 전량청산등의 매도부분을 확인해주세요"라고
+  지시해 해소했다(중간에 "매도 기준 추가하는 게 어떠냐"는 후속 질문에는
+  사용자가 두 번 다 "특이사항 없음"으로 답했었는데, 그 대신 이 구체적 설계
+  문서가 도착해서 이 세션이 수치를 임의로 만들 필요가 없어졌다).
+- 문서가 제시한 구조: **5단계 Exit Engine**(①초기손절 ②긴급청산 ③부분익절
+  ④트레일링스톱 ⑤터틀식 전량청산)과 명확한 **우선순위**(긴급청산 > 손절 >
+  추세/분석논리붕괴 전량청산 > 부분익절 > 정상보유). 문서 §11
+  `PositionExitAnalyzer.analyze()`와 §12 `StopManager.update_stop()`이
+  구체적 코드까지 제공했고, §14 `EXIT_CONFIG`가 최종 추천 수치를 전부 명시함.
+- 구현: `market_intelligence/trade_execution/exit_engine.py` 신규(기존
+  6개 모듈과 동일하게 순수 계산기, API/DB 호출 없음) + `config.py`에
+  `ExitConfig`(불변 dataclass, `DEFAULT_EXIT_CONFIG`) 추가:
+  - `emergency_loss_pct=-8.0%`(당일 급락 시 즉시 전량청산 - 문서 자체가
+    "고정 정답 아님, 백테스트로 조정 필요"라고 명시한 값), `partial_take_profit_r
+    =2.0`/`partial_sell_ratio=0.25`(+2R에서 25% 부분익절), `breakeven_trigger_r
+    =1.0`(+1R부터 손절가를 본전으로), `trailing_start_r=2.0`/
+    `trailing_atr_multiple=3.0`(+2R~+4R 구간 3×ATR 트레일링),
+    `tight_trailing_trigger_r=4.0`/`tight_trailing_atr_multiple=2.5`(+4R
+    이상 2.5×ATR로 더 타이트하게), `turtle_exit_days=10`, `max_rank_drop=80`
+    (진입 시점 대비 랭킹 이만큼 나빠지면 청산), `minimum_sector_score=45.0`/
+    `minimum_theme_score=45.0`(둘 다 미달 시 청산). 전부 문서 §14
+    `EXIT_CONFIG` 그대로 - 이 세션이 정한 숫자 없음.
+  - `analyze_exit(position, market, config)` - 문서 §11 `analyze()`를
+    그대로 이식. 우선순위: 1순위 `EMERGENCY_EXIT`(급락) → 2순위 손절
+    (`INITIAL_STOP`/`TRAILING_STOP`, 아래 필드 통합 설명 참고) → 3순위 MIE
+    분석 논리 붕괴(`RANK_COLLAPSE`/`SECTOR_THEME_COLLAPSE`) → 4순위 부분익절
+    (`TAKE_PROFIT_2R`) → 5순위 터틀 10일 최저가 이탈(`TURTLE_10DAY_EXIT`) →
+    6순위 보유(`HOLD`). 반환값에 `fraction`(매도 비율: 전량=1.0/부분=0.25/
+    보유=0.0)을 추가해서 호출측이 바로 매도수량을 계산할 수 있게 함.
+  - `update_stop(position, current_high, atr20, current_price, config)` -
+    문서 §12 `StopManager.update_stop()` 이식. 최고가 갱신 → 본전보호(+1R)
+    → ATR 트레일링(+2R/+4R, `get_trailing_atr_multiple()`로 배수 결정) 순.
+    손절가는 `max()`로 절대 아래로 안 내려간다(문서가 "이 max()가 매우
+    중요합니다"라고 강조한 부분).
+  - `get_trailing_atr_multiple()`(문서 §8), `calculate_trailing_stop()`
+    (문서 §7 핵심 코드), `compute_lowest_low()`(터틀 10일 최저가 계산 -
+    `atr.compute_atr()`과 동일한 "결측/부족 시 None" 원칙).
+  - **설계 결정 1 - 필드 통합**: 문서 §11 코드는 초기손절에 `stop_price`,
+    트레일링스톱에 별도 `trailing_stop_price`를 쓰지만, §12
+    `StopManager`는 `stop_price` 하나만 갱신해서 문서 자체가 필드명을
+    통일 안 했다 - `stop_price` 하나로 통합하고, `initial_stop_price`
+    (진입 시 1회 계산 후 불변)와 비교해 `INITIAL_STOP`/`TRAILING_STOP`을
+    구분하도록 구현(의미는 완전히 동일, 중복 필드만 제거).
+  - **문서 자체의 계산 오류 1건 추가 발견**: §13 Day15 예시("최고가
+    14,000원, ATR20 500원 → 3×ATR=1,500 → 손절가 12,500원")가 같은 문서
+    §8/§12의 자체 공식과 안 맞는다 - 이 시점 profit_r=(14,000-10,000)/
+    1,000=4.0으로 "+4R 이상은 2.5×ATR" 구간인데 서술은 3×ATR을 씀. 공식대로면
+    12,750원이 맞다. Phase 6-1의 E종목(14주/21주) 오탈자와 같은 유형 -
+    구현은 문서의 공식(코드)을 따르고 서술형 예시 숫자는 따라가지 않았다.
+    `tests/test_exit_engine.py::TestUpdateStop::test_day15_discrepancy_with_document_walkthrough`
+    에 근거를 남겨둠.
+  - `pyramiding.check_stop()`(Phase 6-1의 손절가 단순 체크)은 하위 호환용으로
+    남기되, 실제 배선 시에는 `exit_engine.analyze_exit()`(상위 호환, 손절
+    체크 포함)을 쓰도록 두 파일 docstring에 명시.
+- **검증 완료**: `tests/test_exit_engine.py` 신규 37개 테스트, 문서 §13의
+  종목 A 워크스루(진입 10,000원/ATR 500원/35주, Day1 HOLD → Day3 +0.5R HOLD
+  → Day5 +1R 본전상향(9,000→10,000원) → Day8 +2R 25%부분익절 → Day15
+  트레일링 갱신 → Day20 전량매도)를 그대로 픽스처로 사용. 기존 Phase 6-1
+  테스트(73개)와 합쳐 `market_intelligence/trade_execution/` 전체
+  **110개 전부 통과**(`pytest tests/test_atr.py tests/test_gap_filter.py
+  tests/test_entry_filter.py tests/test_diversification.py
+  tests/test_position_sizer.py tests/test_pyramiding.py
+  tests/test_portfolio_risk.py tests/test_exit_engine.py` → `110 passed`).
+- **여전히 미검증(문서 자체가 명시)**: (1) `emergency_loss_pct=-8%`는 문서
+  스스로 "고정 정답이 아니다, 실제 MIE 과거 성과로 백테스트해서 조정해야
+  한다"고 명시. (2) 문서 §15는 부분익절 방식(VERSION B, 이 구현의 기본값)
+  외에 VERSION A(+2R 전량익절)/VERSION C(익절 없음, 100% 터틀식)도 반드시
+  비교 백테스트하라고 명시 - 이 세션은 VERSION B만 구현했고 백테스트는
+  안 함. 실거래(모의투자 포함) 투입 전 과거 데이터로 세 버전 성과(총수익률/
+  승률/Profit Factor/MDD/Sharpe 등)를 비교할 것을 권장.
+- **아직 안 한 것(다음 단계, Phase 6-1과 동일)**: KIS 주문 API,
+  포지션 추적 DB 테이블, `trade_execution_pipeline.py`(진입+피라미딩+청산
+  전부 엮는 배선, `exit_engine.analyze_exit()`/`update_stop()`을 매일
+  호출), 매일 아침 09:00~09:30 KST 실행 systemd, 모의투자 라이브 검증.
+
 ## 4. 리스크 / 미확정 사항
 - Sector별 PER 중앙값 계산 → **Phase 5-19 완전히 종료(2026-08-24)** -
   마이그레이션/단위테스트/시험(20종목)/전체(2,718종목) 라이브 검증까지
