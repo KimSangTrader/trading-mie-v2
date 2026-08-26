@@ -157,6 +157,12 @@ CREATE TABLE IF NOT EXISTS stock_valuation (
     market_per DECIMAL(10, 2),
     market_pbr DECIMAL(10, 2),
     market_dividend_yield DECIMAL(5, 2),
+    -- 【2026-08-24, Phase 5-19】Sector별 밸류에이션 중앙값 (market_per 등과 별도,
+    -- 표본 부족/sector 미상이면 NULL로 남김 - migrate_add_sector_valuation_columns.py 참고)
+    sector VARCHAR(50),
+    sector_per_median DECIMAL(10, 2),
+    sector_pbr_median DECIMAL(10, 2),
+    sector_dividend_median DECIMAL(5, 2),
     per_relative_score DECIMAL(5, 2),
     pbr_relative_score DECIMAL(5, 2),
     dividend_relative_score DECIMAL(5, 2),
@@ -206,6 +212,83 @@ CREATE INDEX idx_stock_theme_mapping_timestamp ON stock_theme_mapping(timestamp 
 CREATE INDEX idx_stock_theme_mapping_ticker ON stock_theme_mapping(ticker);
 CREATE INDEX idx_stock_theme_mapping_theme ON stock_theme_mapping(theme);
 
+-- 12. 종목별 일봉(OHLCV) 히스토리 (Phase 5-13) - 계층형 스코어링(docs/hierarchical_scoring_plan.md)
+-- 선행 데이터. 배치 스냅샷 패턴이 아니라 (ticker, trade_date)로 유일한 사실 테이블.
+CREATE TABLE IF NOT EXISTS stock_price_history (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(10) NOT NULL,
+    market VARCHAR(10), -- 'KOSPI', 'KOSDAQ', 'KONEX'
+    trade_date VARCHAR(8) NOT NULL, -- 'YYYYMMDD'
+    open DECIMAL(12, 2),
+    high DECIMAL(12, 2),
+    low DECIMAL(12, 2),
+    close DECIMAL(12, 2),
+    volume BIGINT,
+    collected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_stock_price_history_ticker_date UNIQUE(ticker, trade_date)
+);
+
+CREATE INDEX idx_stock_price_history_ticker_date ON stock_price_history(ticker, trade_date DESC);
+CREATE INDEX idx_stock_price_history_trade_date ON stock_price_history(trade_date);
+
+-- 13. 계층형(시장→Sector→Theme→종목) 최종 순위 스냅샷 (Phase 5-16)
+-- analysis_results와 별도 테이블인 이유는 db/models.py StockHierarchicalScore 문서 참고.
+CREATE TABLE IF NOT EXISTS stock_hierarchical_scores (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ticker VARCHAR(10) NOT NULL,
+    market VARCHAR(10),
+    sector VARCHAR(50),
+    primary_theme VARCHAR(50),
+    market_score DECIMAL(5, 2),
+    sector_score DECIMAL(5, 2),
+    theme_score DECIMAL(5, 2),
+    stock_score DECIMAL(5, 2),
+    final_score DECIMAL(5, 2),
+    sector_rank INTEGER,
+    theme_rank INTEGER,
+    overall_rank INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_stock_hierarchical_scores_timestamp ON stock_hierarchical_scores(timestamp DESC);
+CREATE INDEX idx_stock_hierarchical_scores_ticker ON stock_hierarchical_scores(ticker);
+CREATE INDEX idx_stock_hierarchical_scores_final_score ON stock_hierarchical_scores(final_score DESC);
+
+-- 14. 현재 보유 중인 매매 포지션 추적 (Phase 6-3) - db/models.py TradePosition 문서 참고.
+-- trading_history(7번, append-only 개별 체결 기록)와 달리 이 테이블은 UPDATE되는
+-- "현재 상태"(손절가/최고가/평균단가/보유수량 등)를 담는다.
+CREATE TABLE IF NOT EXISTS trade_positions (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(10) NOT NULL,
+    market VARCHAR(10),
+    sector VARCHAR(50),
+    primary_theme VARCHAR(50),
+    status VARCHAR(10) NOT NULL DEFAULT 'OPEN', -- 'OPEN', 'CLOSED'
+    entry_price DECIMAL(12, 2),
+    entry_rank INTEGER,
+    entry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    initial_stop_price DECIMAL(12, 2),
+    initial_risk_per_share DECIMAL(12, 2),
+    stop_price DECIMAL(12, 2),
+    highest_price DECIMAL(12, 2),
+    average_price DECIMAL(12, 2),
+    quantity INTEGER,
+    target_shares INTEGER,
+    entry_count INTEGER DEFAULT 1,
+    last_entry_price DECIMAL(12, 2),
+    partial_profit_taken BOOLEAN DEFAULT FALSE,
+    closed_at TIMESTAMP,
+    close_price DECIMAL(12, 2),
+    close_reason VARCHAR(30),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_trade_positions_ticker ON trade_positions(ticker);
+CREATE INDEX idx_trade_positions_status ON trade_positions(status);
+
 -- ==========================================
 -- 권한 설정
 -- ==========================================
@@ -227,3 +310,6 @@ COMMENT ON TABLE system_status IS '시스템 상태 모니터링';
 COMMENT ON TABLE stock_valuation IS '종목별 PER/PBR/배당수익률 및 시장(KOSPI/KOSDAQ) 상대평가 결과';
 COMMENT ON TABLE stock_sector_mapping IS '종목별 Analysis_Sector 매핑 (사용자 1차 분류 엑셀 원본)';
 COMMENT ON TABLE stock_theme_mapping IS '종목별 Theme 매핑 (Primary/Secondary, 다대다)';
+COMMENT ON TABLE stock_price_history IS '종목별 일봉(OHLCV) 히스토리 (계층형 스코어링 선행 데이터)';
+COMMENT ON TABLE stock_hierarchical_scores IS '시장→Sector→Theme→종목 계층형 최종 순위 스냅샷';
+COMMENT ON TABLE trade_positions IS '현재 보유 중인 매매 포지션 추적 (Phase 6-3, UPDATE되는 상태값)';

@@ -115,6 +115,14 @@ class TradingConfig:
     # ---------- 후보 풀 ----------
     total_candidates: int = 30                      # 계층형 랭킹에서 뽑아올 후보 수(사용자 확정값)
 
+    # ---------- 【2026-08-26, Phase 6-3】진입 시 실행 파이프라인 전용 값 ----------
+    # entry_filter.check_entry()가 갭 +7~+12%에서 반환하는 "REDUCE"는 문서(§4)가
+    # "매수 비중 축소"라고만 서술하고 구체적 축소 비율은 주지 않았다(entry_filter.py
+    # docstring "실제 축소는 호출부/포지션사이저 몫" 참고) - trade_execution_pipeline.py가
+    # target_shares에 이 배수를 곱해서 축소한다. 문서에 없는 값이라 이 세션이 임의로
+    # 0.5(절반)를 골랐다 - 백테스트/실거래 경험으로 조정이 필요할 수 있는 값.
+    reduce_position_ratio: float = 0.5
+
 
 # 문서의 갭 필터 5단계 판정표(check_opening_gap() 원문 그대로) - GapFilter가
 # 이 순서로 그대로 사용한다. (하한, 상한, 판정] 형태. 상한 없음은 None으로 표시.

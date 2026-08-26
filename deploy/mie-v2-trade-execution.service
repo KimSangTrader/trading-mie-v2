@@ -1,0 +1,20 @@
+[Unit]
+Description=MIE V2.0 - 매매 실행(청산/피라미딩/신규진입) 자동 사이클
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+# 보유 포지션 청산 판정 -> 피라미딩(추가매수) 판정 -> 신규 진입 판정을 순서대로
+# 실행하고, 승인된 매수/매도는 KIS 주문 API(모의투자, .env의 KIS_DEV_*)로 실제
+# 주문까지 낸다. 완전자동(사람 승인 없음) - 사용자가 AskUserQuestion으로 확정한
+# 설계 그대로. main.py serve(19:00 KST 일마감 분석)가 전날 밤 계산해 둔
+# stock_hierarchical_scores 최신 배치를 그대로 후보 풀로 쓴다.
+ExecStart=/opt/mie-v2/venv/bin/python -m market_intelligence.trade_execution.trade_execution_pipeline
+StandardOutput=append:/var/log/mie-v2/trade_execution.log
+StandardError=append:/var/log/mie-v2/trade_execution.log
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 보유/후보 종목 각각 KIS 일봉 조회(get_stock_daily_chart) 1회씩 순차 호출이라
+# 종목 수에 비례해 시간이 걸린다(mie-v2-valuation.service와 동일한 이유로 여유 확보).
+TimeoutStartSec=1800

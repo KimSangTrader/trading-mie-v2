@@ -698,6 +698,70 @@ SQLite 단위테스트 + 코드 리뷰로만 검증했다(이 프로젝트의 �
   전부 엮는 배선, `exit_engine.analyze_exit()`/`update_stop()`을 매일
   호출), 매일 아침 09:00~09:30 KST 실행 systemd, 모의투자 라이브 검증.
 
+### Phase 6-3 — KIS 주문 API + 포지션 DB + trade_execution_pipeline.py + systemd [2026-08-26]
+- 배경: 사용자가 "진행합니다"라고 지시해 Phase 6-1/6-2의 "아직 안 한 것" 목록을
+  이어서 구현 - 순수 계산기들을 실제 KIS 주문/DB에 연결하는 단계.
+- **`data/kis_client.py`에 주문 API 3종 추가**: `place_order()`(매수/매도),
+  `get_balance()`(잔고조회), `get_pending_orders()`(미체결조회). tr_id/엔드포인트/
+  필수 파라미터는 이 세션이 KIS 공식 GitHub(koreainvestment/open-trading-api)의
+  `order_cash.py`/`inquire_balance.py`/`inquire_psbl_rvsecncl.py`와 `kis_auth.py`를
+  직접 fetch해서 확인한 것(추측 아님) - 매수 tr_id는 TTTC0012U(실전)/VTTC0012U
+  (모의), 매도는 TTTC0011U/VTTC0011U (이전에 추측했던 08xxU 계열이 아니었음 -
+  이번에 공식 소스로 처음 확인). `get_pending_orders()`의 모의투자 tr_id
+  (VTTC0084R)만 공식 예제에 명시가 없어 `kis_auth.py`의 T→V 치환 규칙으로 추정.
+  **응답 필드명(pdno/hldg_qty/pchs_avg_pric 등)은 여전히 라이브 미검증** - 기존
+  `get_stock_daily_chart()`/`get_investor_trend()`와 동일한 한계, `get_balance()`는
+  검증 편의를 위해 raw_output1/raw_output2를 그대로 반환에 포함시켜뒀다. 자세한
+  근거는 `data/kis_client.py` 파일 상단 변경이력 【2026-08-26】참고.
+- **`db/models.py`에 `TradePosition` 테이블 신규**(Phase 6-1이 "별도로 필요"라고
+  미리 지적해뒀던 것): 기존 `TradingHistory`(append-only 개별 체결 기록)와 달리
+  손절가/최고가/평균단가/보유수량처럼 계속 갱신되는 "현재 상태"를 담는다.
+  `target_shares`(최초 진입 시 계산해 고정한 목표 총수량) 컬럼을 추가로 뒀다 -
+  피라미딩 회차별 매수량(`split_entry_shares()`)을 이 값 기준으로 나누기 위함
+  (매번 새로 `calculate_position()`을 부르지 않음 - 위험 예산은 최초 진입 시점에
+  확정된다는 문서의 설계 그대로). `db/schema.sql`에도 14번 테이블로 동일하게
+  추가(신규 테이블이라 `create_tables.py`만으로 충분 - 기존 테이블 컬럼 추가와
+  달리 별도 `migrate_add_*` 스크립트 불필요).
+- **`market_intelligence/trade_execution/trade_execution_pipeline.py` 신규**:
+  `run_exit_pipeline()`(청산 판정+주문+손절가 일일 갱신) → `run_pyramiding_pipeline()`
+  (추가매수 판정+주문) → `run_entry_pipeline()`(신규 진입 판정+주문+포지션 생성)을
+  `run_trade_execution_cycle()`로 묶었다. 실행 순서(청산 먼저)는 문서에 명시가
+  없어 이 세션이 "매도로 회수되는 현금/위험 예산이 그날 매수 판단에 반영돼야
+  한다"는 상식적 근거로 정한 것 - 다음 단계에서 사용자 확인 가능.
+  `diversify_candidates()`(Phase 6-1, 기존 포지션 개념이 없는 순수 함수)를
+  기존 보유 종목을 "이미 선택된 것"으로 앞세워 호출하는 방식으로 Sector/Theme/
+  최대보유종목수 예산을 기존 포지션과 실제로 공유하게 만들었다(파일 내 주석에
+  상세 설명). `config.py`에 `reduce_position_ratio=0.5`(갭 +7~12% REDUCE 시
+  목표수량 축소 비율) 추가 - 문서에 구체적 수치가 없어 이 세션이 임의로 정한 값
+  (entry_filter.py가 이미 "실제 축소는 호출부 몫"이라고 남겨뒀던 부분).
+- **검증**: 이 세션은 sqlalchemy가 설치되어 있지 않아(PyPI 네트워크 차단, Phase 5
+  이후 동일한 한계) 실제 SQLite pytest 실행은 못 했다. 대신 (1)
+  `tests/test_trade_execution_pipeline.py`(SQLAlchemy 기반, `test_price_history_pipeline.py`와
+  동일한 Mock+SQLite 패턴, 17개 테스트 - 청산/부분익절/보유/피라미딩/신규진입/
+  Sector예산/최대보유/주문실패/전체사이클/dry_run)를 작성하고, (2) 별도로 최소
+  SQLAlchemy 흉내 객체(실제 쿼리 파싱 없이 `filter`/`filter_by`/`all`/`add`/
+  `commit`만 재현)를 이 세션에서 직접 만들어 같은 시나리오 17개를 실제로 실행해
+  전부 통과함을 확인했다(진짜 sqlalchemy는 아니지만 파이프라인 로직 자체의
+  분기/계산은 기계적으로 검증됨 - 손절 발동, +2R 부분익절 수량(35주→27주)과
+  트레일링 손절가(10,500원) 재계산, 피라미딩 2차 수량(8주) 및 평단 갱신, Sector
+  예산으로 신규진입 차단, 최대보유종목 도달 시 즉시 스킵, 주문 실패 시 DB
+  미반영, 청산→진입 순서로 슬롯이 재활용되는 전체 사이클까지 전부 일치).
+  실제 SQLite(사용자 컴퓨터, sqlalchemy 설치돼 있음)에서 `tests/test_trade_execution_pipeline.py`를
+  마지막으로 한 번 더 실행해 확인할 것을 권장.
+- **`deploy/mie-v2-trade-execution.service`/`.timer` 신규**: 평일 09:05 KST
+  (정규장 개장 5분 후) `trade_execution_pipeline.py`를 1회 실행. 5분 지연은
+  개장 직후 호가/체결 불안정 구간을 피하려는 것 - 정확한 최적 지연은 라이브
+  검증 후 조정 가능. `mie-v2-krx-import.timer`/`mie-v2-valuation.timer`와
+  동일하게 `Asia/Seoul` 명시(서버 시스템 타임존 무관하게 KST 기준 실행).
+- **알려진 한계/다음 단계**: (1) 시장가 주문 체결가를 즉시 알 수 없어 주문 시점
+  참조가격을 포지션 진입가/평단으로 그대로 씀(실제 체결가와 오차 가능 - 사후
+  대사 로직 없음). (2) `get_balance()` 페이지네이션 미구현(700만원/최대7종목
+  설계로는 충분할 것으로 보이나 미검증). (3) Phase 6-2가 남긴 백테스트 검증
+  (긴급청산 -8%, 부분익절 vs 전량익절 vs 익절없음 비교)은 여전히 안 함.
+  (4) 이 파이프라인은 아직 실제 KIS 모의투자 계좌로 단 한 번도 실행된 적이
+  없다 - **사용자 컴퓨터/EC2에서 반드시 라이브 검증 필요** (이 세션은 실제
+  주문을 절대 실행하지 않음 - 안전 정책).
+
 ## 4. 리스크 / 미확정 사항
 - Sector별 PER 중앙값 계산 → **Phase 5-19 완전히 종료(2026-08-24)** -
   마이그레이션/단위테스트/시험(20종목)/전체(2,718종목) 라이브 검증까지

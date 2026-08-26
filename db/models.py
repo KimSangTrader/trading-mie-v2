@@ -248,6 +248,15 @@ class StockValuation(Base):
     market_per = Column(Numeric(10, 2))
     market_pbr = Column(Numeric(10, 2))
     market_dividend_yield = Column(Numeric(5, 2))
+    # 【2026-08-24, Phase 5-19】Sector별 밸류에이션 중앙값 - 위 market_per 등(시장
+    # 전체 중앙값)과 별도로 저장한다(기존 컬럼 의미는 안 바꿈). Sector 표본이
+    # 부족하거나 sector 자체가 없으면 NULL로 남는다(0이나 시장값으로 대신 채우지
+    # 않음 - StockAnalyzer가 이 컬럼이 NULL이면 market_per로 자동 대체하도록 이미
+    # 설계돼 있으므로, 여기서 값을 만들어 채우면 그 자동 대체가 조용히 막힌다).
+    sector = Column(String(50))
+    sector_per_median = Column(Numeric(10, 2))
+    sector_pbr_median = Column(Numeric(10, 2))
+    sector_dividend_median = Column(Numeric(5, 2))
     per_relative_score = Column(Numeric(5, 2))
     pbr_relative_score = Column(Numeric(5, 2))
     dividend_relative_score = Column(Numeric(5, 2))
@@ -302,6 +311,80 @@ class StockSectorMapping(Base):
         return f"<StockSectorMapping(ticker={self.ticker}, sector={self.sector}, market={self.market})>"
 
 
+class StockPriceHistory(Base):
+    """종목별 일봉(OHLCV) 히스토리 (Phase 5-13: 계층형 스코어링용 선행 데이터)
+
+    docs/hierarchical_scoring_plan.md Phase 1 참고. 방법론 문서(sector_analy_method.txt)의
+    Sector/Theme/종목 점수 공식(5·20·60일 수익률, 상대강도, 상승확산도, 거래대금 증가 등)이
+    모두 종목별 일별 시계열을 전제로 하는데, 이 테이블이 생기기 전에는 어디에도 저장되지
+    않고 있었다(data/kis_client.py의 get_stock_daily_chart()로 "가져오는" 방법만 있었음).
+
+    stock_valuation/stock_sector_mapping처럼 "매번 새 timestamp로 통째로 insert"하는
+    배치 스냅샷 패턴이 아니다 - 종목의 특정 거래일 시세는 사실 하나뿐이므로
+    (ticker, trade_date) 조합으로 유일해야 하고, 수집을 여러 번 반복해도 이미 있는
+    거래일은 다시 만들지 않고 새로 생긴 거래일만 누적된다(파이프라인 쪽 책임 -
+    market_intelligence/collectors/price_history_pipeline.py 참고).
+    """
+    __tablename__ = "stock_price_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(10), nullable=False)
+    market = Column(String(10))  # 'KOSPI', 'KOSDAQ', 'KONEX'
+    trade_date = Column(String(8), nullable=False)  # 'YYYYMMDD' - KIS API 원본 형식 그대로
+    open = Column(Numeric(12, 2))
+    high = Column(Numeric(12, 2))
+    low = Column(Numeric(12, 2))
+    close = Column(Numeric(12, 2))
+    volume = Column(BigInteger)
+    collected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_stock_price_history_ticker_date', 'ticker', 'trade_date', unique=True),
+        Index('idx_stock_price_history_trade_date', 'trade_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockPriceHistory(ticker={self.ticker}, trade_date={self.trade_date}, close={self.close})>"
+
+
+class StockHierarchicalScore(Base):
+    """계층형(시장→Sector→Theme→종목) 최종 순위 스냅샷 (Phase 5-16)
+
+    market_intelligence/hierarchical_ranker.py의 rank_stocks() 결과를 그대로 저장한다.
+    AnalysisResults 테이블에 컬럼을 추가하는 대신 별도 테이블로 둔 이유: AnalysisResults는
+    timestamp에 UNIQUE 제약이 걸린 "실행 1회당 요약 행 1개" 구조라 종목별로 여러 행이
+    필요한 이 데이터와 맞지 않는다. 대신 stock_valuation과 동일한 배치(timestamp) 패턴을
+    따른다 - 실행마다 새 timestamp로 종목 수만큼 insert하고, 조회는 항상 최신 배치만 본다.
+    """
+    __tablename__ = "stock_hierarchical_scores"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    ticker = Column(String(10), nullable=False)
+    market = Column(String(10))
+    sector = Column(String(50))
+    primary_theme = Column(String(50))
+    market_score = Column(Numeric(5, 2))
+    sector_score = Column(Numeric(5, 2))
+    theme_score = Column(Numeric(5, 2))
+    stock_score = Column(Numeric(5, 2))
+    final_score = Column(Numeric(5, 2))
+    sector_rank = Column(Integer)
+    theme_rank = Column(Integer)
+    overall_rank = Column(Integer)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_stock_hierarchical_scores_timestamp', 'timestamp'),
+        Index('idx_stock_hierarchical_scores_ticker', 'ticker'),
+        Index('idx_stock_hierarchical_scores_final_score', 'final_score'),
+    )
+
+    def __repr__(self):
+        return f"<StockHierarchicalScore(ticker={self.ticker}, final_score={self.final_score})>"
+
+
 class StockThemeMapping(Base):
     """종목별 Theme 매핑 - 종목 1개가 여러 테마에 속할 수 있어(Primary + Secondary)
     stock_sector_mapping과 별도로 다대다(종목:테마) 형태로 저장한다.
@@ -327,6 +410,66 @@ class StockThemeMapping(Base):
 
     def __repr__(self):
         return f"<StockThemeMapping(ticker={self.ticker}, theme={self.theme}, is_primary={self.is_primary})>"
+
+
+class TradePosition(Base):
+    """현재 보유 중인 매매 포지션 추적 (Phase 6-3: 실제 매매 프로그램).
+
+    기존 TradingHistory는 "개별 거래 기록"(체결 1건 = 1행, 재활용해서 계속 씀 -
+    market_intelligence/trade_execution_pipeline.py가 매수/매도 체결마다 여기 1행씩
+    남긴다)용이라 "지금 이 종목을 얼마에 몇 주 들고 있고 손절가가 어디인지"처럼
+    시간에 따라 값이 바뀌는(UPDATE되는) 상태를 표현할 수 없다 - stop_price/
+    highest_price/average_price/quantity/entry_count/partial_profit_taken은 전부
+    보유 기간 내내 계속 갱신되는 값이라 append-only인 TradingHistory와 근본적으로
+    다른 테이블이 필요했다(Phase 6-1 docs 변경이력의 "아직 안 한 것" 항목 그대로).
+
+    market_intelligence/trade_execution/의 순수 계산기(pyramiding.should_add,
+    exit_engine.analyze_exit/update_stop)가 요구하는 position 딕셔너리 필드와
+    1:1로 대응하도록 컬럼을 설계했다 - trade_execution_pipeline.py가 이 ORM 행을
+    그대로 dict로 변환해서 순수 계산기에 넘긴다(변환 함수: position_to_dict()).
+    """
+    __tablename__ = "trade_positions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(10), nullable=False)
+    market = Column(String(10))  # 'KOSPI', 'KOSDAQ'
+    sector = Column(String(50))
+    primary_theme = Column(String(50))
+    status = Column(String(10), nullable=False, default="OPEN")  # 'OPEN' | 'CLOSED'
+
+    entry_price = Column(Numeric(12, 2))          # 최초 1차 매수가(고정, 이후 안 바뀜)
+    entry_rank = Column(Integer)                    # 최초 매수 시점의 계층형 overall_rank(고정)
+    entry_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    initial_stop_price = Column(Numeric(12, 2))    # 최초 계산된 손절가(고정, exit_engine이 INITIAL_STOP/TRAILING_STOP 구분에 사용)
+    initial_risk_per_share = Column(Numeric(12, 2))  # entry_price - initial_stop_price(고정) - R 배수 계산의 분모
+    stop_price = Column(Numeric(12, 2))              # 현재 유효 손절가(exit_engine.update_stop()이 위로만 갱신)
+    highest_price = Column(Numeric(12, 2))           # 보유 기간 중 최고가(트레일링 스톱 계산용)
+
+    average_price = Column(Numeric(12, 2))           # 현재 평균단가(피라미딩 시 갱신)
+    quantity = Column(Integer)                        # 현재 보유 수량(부분익절/피라미딩마다 갱신)
+    target_shares = Column(Integer)                    # 최초 진입 시 position_sizer.calculate_position()으로
+                                                          # 계산한 목표 총수량(고정) - 1/2/3차 분할매수 비중
+                                                          # (split_entry_shares())을 이 값 기준으로 나눈다
+    entry_count = Column(Integer, default=1)          # 지금까지의 분할매수(피라미딩 포함) 횟수
+    last_entry_price = Column(Numeric(12, 2))        # 가장 최근 매수 체결가(피라미딩 트리거 계산용)
+    partial_profit_taken = Column(Boolean, default=False)  # +2R 부분 익절을 이미 실행했는지
+
+    closed_at = Column(DateTime)
+    close_price = Column(Numeric(12, 2))
+    close_reason = Column(String(30))  # exit_engine의 reason 그대로: INITIAL_STOP/TRAILING_STOP/EMERGENCY_EXIT/RANK_COLLAPSE/SECTOR_THEME_COLLAPSE/TURTLE_10DAY_EXIT 등
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index('idx_trade_positions_ticker', 'ticker'),
+        Index('idx_trade_positions_status', 'status'),
+    )
+
+    def __repr__(self):
+        return f"<TradePosition(ticker={self.ticker}, status={self.status}, quantity={self.quantity}, stop_price={self.stop_price})>"
+
 
 # ==========================================
 # Database Session 관리
@@ -366,6 +509,11 @@ __all__ = [
     'TradingHistory',
     'SystemStatus',
     'StockValuation',
+    'StockSectorMapping',
+    'StockThemeMapping',
+    'StockPriceHistory',
+    'StockHierarchicalScore',
+    'TradePosition',
     'get_database_url',
     'create_session',
     'create_tables',

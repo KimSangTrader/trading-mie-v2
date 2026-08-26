@@ -1,0 +1,17 @@
+[Unit]
+Description=MIE V2.0 - 매매 실행 사이클 매일 1회 실행 (평일 09:05 KST, 장 시작 직후)
+
+[Timer]
+# 한국 증시 정규장 개장(09:00 KST) 5분 뒤에 mie-v2-trade-execution.service를
+# 1회 실행한다. 개장 직후 5분을 두는 이유: 시가 형성 직후 호가/체결이 아직
+# 불안정할 수 있어(스프레드가 넓거나 유동성이 낮음) entry_filter의 갭 판정
+# (당일 시가 vs 전일 종가)이 조금이라도 더 안정된 시점의 시세를 쓰도록 함 -
+# 정확한 최적 지연 시간은 사용자가 라이브 검증하면서 조정 가능.
+# 【타임존 주의】mie-v2-krx-import.timer/mie-v2-valuation.timer와 동일한 이유로
+# Asia/Seoul 명시(서버 시스템 타임존이 UTC여도 항상 KST 09:05에 실행되게 함).
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Seoul
+Persistent=true
+Unit=mie-v2-trade-execution.service
+
+[Install]
+WantedBy=timers.target
