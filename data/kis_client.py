@@ -123,6 +123,30 @@ KIS API 클라이언트 (환경별 자동 선택)
   호출하지 않고 즉시 실패를 반환한다 - 이 메서드 자체는 모의/실전 어느 쪽이든
   "이 세션이 직접 호출하지 않는다"(파이프라인은 사용자 컴퓨터/EC2에서만 실행) -
   이 세션은 코드만 작성하고 실제 주문 실행은 절대 하지 않는다.
+【2026-08-27】__init__에 environment 파라미터 추가 (안전 관련 발견)
+- 배경: 사용자가 EC2에서 trade_execution_pipeline.py를 처음 수동 실행한 로그를
+  공유했는데, 토큰 발급 URL이 `https://openapi.koreainvestment.com:9443`
+  (PROD_BASE_URL - 실전투자)였다. 즉 EC2의 .env에 `ENVIRONMENT=production`이
+  설정돼 있고, 지금까지의 KISClient()는 이 값을 그대로 읽으므로
+  trade_execution_pipeline.py의 `KISClient()`도 자동으로 **실전투자(진짜
+  돈) 계정**으로 초기화되고 있었다 - 사용자가 AskUserQuestion에서 명시적으로
+  확정한 "모의투자부터 시작"과 반대 상태.
+- 다행히 이번 실행에서는 실제 매수/매도 주문까지는 가지 않았다(잔고조회가
+  계좌번호 형식 오류로 실패해서 available_cash가 0으로 처리돼 모든 후보가
+  진입 조건 이전에 걸러짐 - 아래 항목 참고). 하지만 그 계좌번호 오류만
+  아니었다면 실전 계정으로 실제 주문이 나갔을 수 있는 상황이었다.
+- 원인: main.py 등 기존 시스템은 ENVIRONMENT=production을 "실전 서버의 더
+  정확한 시세를 쓰겠다"는 의도로 설정해 둔 것으로 보이는데(시세 조회 API는
+  계정 종류와 무관하게 안전함 - 실제 돈이 움직이지 않음), place_order()처럼
+  "주문"을 내는 메서드까지 같은 환경 변수를 공유하다 보니, 시세용 설정이
+  주문 실행 환경까지 그대로 따라가 버렸다.
+- 조치: __init__(environment=None) 파라미터를 추가해서, 호출부가 명시적으로
+  environment를 넘기면 .env의 전역 ENVIRONMENT를 무시하고 그 값을 강제할 수
+  있게 했다. trade_execution_pipeline.py의 진입점(__main__)이 이제
+  `MIE_TRADE_ENVIRONMENT`라는 별도 환경변수(.env의 기존 ENVIRONMENT와 완전히
+  분리, 기본값 "development"=모의투자)로 KISClient를 만든다 - 자세한 내용은
+  trade_execution_pipeline.py 변경이력 참고. main.py 등 기존 호출부는
+  `KISClient()`를 인자 없이 그대로 쓰므로 동작 변화 없음(하위 호환).
 ================================================================================
 """
 import requests
@@ -168,11 +192,24 @@ class KISClient:
     # 마다 한 번만 재발급하고 그 사이엔 기존 토큰을 재사용한다.
     TOKEN_REFRESH_INTERVAL_SECONDS = 22 * 60 * 60
 
-    def __init__(self):
-        """KIS API 클라이언트 초기화 (환경별 자동 선택)"""
-        
+    def __init__(self, environment: Optional[str] = None):
+        """KIS API 클라이언트 초기화 (환경별 자동 선택)
+
+        Args:
+            environment: "production" | "development" 중 하나를 명시적으로 넘기면
+                .env의 ENVIRONMENT 변수를 무시하고 이 값을 그대로 쓴다. None(기본값,
+                기존 모든 호출부의 동작 그대로 유지)이면 지금까지처럼 .env의
+                ENVIRONMENT를 읽는다. 【2026-08-27 추가, Phase 6-3 라이브 검증 중
+                발견】trade_execution_pipeline.py처럼 "이 클라이언트는 반드시
+                모의투자여야 한다"는 요구가 있는 호출부가, main.py 등 나머지
+                시스템이 시세 수집용으로 쓰는 전역 ENVIRONMENT(실전 서버 - 시세
+                품질을 위해 의도적으로 그렇게 설정돼 있음, PROD 계정에도 시세
+                조회는 안전함)에 실수로 얽혀 들어가지 않게 하려고 추가했다.
+                자세한 경위는 파일 상단 변경이력 【2026-08-27】참고.
+        """
+
         # 환경 설정 확인
-        self.environment = os.getenv('ENVIRONMENT', 'development').lower()
+        self.environment = (environment or os.getenv('ENVIRONMENT', 'development')).lower()
         
         # 환경에 따라 키와 URL 선택
         if self.environment == 'production':

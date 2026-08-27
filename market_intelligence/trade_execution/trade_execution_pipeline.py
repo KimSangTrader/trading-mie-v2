@@ -44,6 +44,28 @@ pyramiding/exit_engine) ↔ KIS 주문 API ↔ DB(trade_positions/trading_histor
   포지션의 entry_price/average_price에 그대로 쓴다. 실제 체결가와 오차가 있을
   수 있다 - 다음 단계에서 get_pending_orders()/체결내역 조회로 사후 대사(재무
   정합성 확인)하는 로직을 추가하는 것을 권장.
+
+【2026-08-27】__main__이 KISClient를 강제로 모의투자(development)로 생성하도록 수정
+  (EC2 최초 라이브 실행 로그에서 발견한 안전 문제)
+- 배경: 사용자가 EC2에서 이 파일을 수동 실행(`systemctl start`)한 로그를
+  공유했는데, 토큰 발급 URL이 PROD_BASE_URL(실전투자)이었다 - EC2 .env의
+  ENVIRONMENT=production을 main.py(시세 수집용, 실전 서버 시세가 더 정확해서
+  의도적으로 그렇게 설정됨 - 시세 조회는 계정 종류와 무관하게 안전함)뿐 아니라
+  이 파일의 `KISClient()`도 그대로 물려받고 있었던 것 - 사용자가 AskUserQuestion
+  에서 명시적으로 확정한 "모의투자부터 시작"과 반대. 다행히 그 실행에서는
+  잔고조회가 계좌번호 형식 오류로 실패해 available_cash가 0이 되면서 실제 주문
+  직전에 전부 걸러졌지만(아래 계좌번호 항목 참고), 그 우연이 없었다면 실전 계정
+  으로 진짜 주문이 나갈 뻔한 상황이었다.
+- 조치: data/kis_client.py의 KISClient.__init__에 environment 파라미터를
+  추가했고(그 파일 변경이력 【2026-08-27】참고), 이 파일의 __main__은 이제
+  `.env`의 전역 ENVIRONMENT가 아니라 **별도의 MIE_TRADE_ENVIRONMENT** 환경변수
+  (기본값 "development"=모의투자)로 KISClient를 만든다. 즉 EC2의 ENVIRONMENT가
+  production으로 남아 있어도(main.py 시세 수집은 그대로 실전 서버 시세를 씀)
+  주문 실행 파이프라인은 사용자가 .env에 `MIE_TRADE_ENVIRONMENT=production`을
+  **의식적으로 추가하지 않는 한** 항상 모의투자로만 동작한다 - 기본값이 항상
+  안전한 쪽(모의투자)이 되도록 설계했다. 실전 전환은 이 한 줄을 .env에 추가하는
+  분명한 결정이 되게 함으로써, 다른 목적(시세 품질)으로 설정된 환경변수에
+  실수로 끌려가지 않게 했다.
 ================================================================================
 """
 import logging
@@ -513,14 +535,26 @@ def build_market_data_and_candidates(session, kis_client, config: TradingConfig 
 
 
 if __name__ == "__main__":
+    import os
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
     from config.database import SessionLocal
     from data.kis_client import KISClient
 
+    # 【안전 기본값 - 2026-08-27】.env의 전역 ENVIRONMENT(main.py 시세 수집용,
+    # EC2에서 production으로 설정돼 있음)를 그대로 물려받지 않는다. 이 파이프라인은
+    # 실제 주문을 내므로 별도의 MIE_TRADE_ENVIRONMENT를 쓰고, 이 변수가 없으면
+    # 항상 "development"(모의투자)로 시작한다 - 실전 전환은 .env에
+    # MIE_TRADE_ENVIRONMENT=production을 명시적으로 추가해야만 일어난다.
+    # 자세한 경위는 파일 상단 변경이력 【2026-08-27】참고.
+    trade_environment = os.getenv("MIE_TRADE_ENVIRONMENT", "development").lower()
+    print(f"⚠️  매매 실행 환경: {trade_environment} "
+          f"({'실전투자 - 진짜 주문' if trade_environment == 'production' else '모의투자'})")
+
     session = SessionLocal()
     try:
-        kis_client = KISClient()
+        kis_client = KISClient(environment=trade_environment)
         market_data_by_ticker, ranked_candidates = build_market_data_and_candidates(session, kis_client)
         result = run_trade_execution_cycle(session, kis_client, market_data_by_ticker, ranked_candidates)
         print(f"\n청산: {result['exit']}")
