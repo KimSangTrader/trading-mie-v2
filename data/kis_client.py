@@ -1021,16 +1021,34 @@ class KISClient:
             return {}
 
     def _split_account(self):
-        """self.account("XXXXXXXX-XX" 또는 구분자 없는 10자리)를 KIS 주문/조회 API가
-        요구하는 CANO(종합계좌번호 8자리)/ACNT_PRDT_CD(계좌상품코드 2자리)로 분리한다.
+        """self.account("XXXXXXXX-XX" 또는 구분자 없는 10자리, 또는 상품코드 없는
+        8자리)를 KIS 주문/조회 API가 요구하는 CANO(종합계좌번호 8자리)/
+        ACNT_PRDT_CD(계좌상품코드 2자리)로 분리한다.
 
-        형식이 둘 다 아니면(길이가 안 맞으면) 추측하지 않고 예외를 던진다 -
-        잘못 분리된 계좌번호로 주문을 넣는 것보다 아예 실패하는 게 안전하다."""
+        【2026-08-27】8자리(상품코드 없음)인 경우 "01"(개인 위탁종합계좌 표준
+        상품코드)을 자동으로 붙이도록 변경 - 사용자 요청("cano 뒤에 01을 붙이면
+        될 것 같다"). 이전에는 이 경우 예외를 던져 사용자가 .env를 직접
+        "CANO-01" 형식으로 고치게 했었다. "01"이 아닌 다른 상품코드를 쓰는
+        계좌라면(예: 연금/ISA 등 특수 계좌) 이 자동 처리가 틀릴 수 있으므로,
+        일반 위탁계좌가 아니면 .env에 "CANO-XX" 형식으로 직접 명시해야 한다 -
+        어떤 값이 쓰였는지는 실행할 때마다 로그로 출력한다.
+
+        8자리도 아니고 10자리 이상(또는 "-" 포함)도 아니면(길이가 완전히
+        안 맞으면) 추측하지 않고 예외를 던진다 - 잘못 분리된 계좌번호로 주문을
+        넣는 것보다 아예 실패하는 게 안전하다."""
         account = (self.account or "").strip()
         if "-" in account:
             cano, acnt_prdt_cd = account.split("-", 1)
         elif len(account) >= 10:
             cano, acnt_prdt_cd = account[:8], account[8:10]
+        elif len(account) == 8 and account.isdigit():
+            cano, acnt_prdt_cd = account, "01"
+            print(
+                f"⚠️  계좌번호에 상품코드가 없어 기본값 '01'(개인 위탁종합계좌)을 "
+                f"자동으로 붙였습니다 (CANO={cano}). 실제 계좌 상품코드가 다르면 "
+                f".env의 KIS_{'PROD' if self.environment == 'production' else 'DEV'}_ACCOUNT_NUMBER를 "
+                f"'{cano}-XX' 형식으로 직접 지정하세요."
+            )
         else:
             raise ValueError(
                 f"계좌번호를 CANO(8자리)/ACNT_PRDT_CD(2자리)로 분리할 수 없습니다 "

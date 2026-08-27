@@ -800,6 +800,38 @@ SQLite 단위테스트 + 코드 리뷰로만 검증했다(이 프로젝트의 �
   (3) `get_balance()`의 raw_output1/output2 필드명이 실제로 맞는지 재실행 로그로
   확인(계좌번호가 고쳐져야 이 부분이 실행됨).
 
+#### Phase 6-3 두 번째 라이브 실행 결과 - 모의투자 서버 시세 API 불안정 발견 [2026-08-27]
+- 위 안전 수정(`MIE_TRADE_ENVIRONMENT`) 반영 후 사용자가 EC2에서 재실행. 결과:
+  토큰 발급 URL이 이제 `openapivts.koreainvestment.com:29443`(DEV/모의투자)로
+  정상 확인 - 안전 수정이 의도대로 작동함을 확인. 그러나 발견 2(계좌번호 형식
+  오류)는 `KIS_DEV_ACCOUNT_NUMBER`에서도 동일하게 재현 - 아직 사용자가 수정하지
+  않은 상태(위 "다음 라이브 실행 전 사용자 확인 필요" 항목 (2) 미완료).
+- **🟡 발견 3 - 모의투자 서버의 개별 종목 일봉 조회 API 불안정**: 같은 약 29개
+  종목에 대해 `get_stock_daily_chart()`(tr_id FHKST03010100)를 호출했는데, 첫 번째
+  실행(PROD 서버)에서는 1종목(462860)만 HTTP 500이었던 반면, 이번(DEV 서버)에는
+  약 20종목이 HTTP 500으로 실패했다. 코드 버그가 아니라 KIS 플랫폼 자체가
+  모의투자 서버에서 이 시세 조회 API를 실전 서버만큼 안정적으로 지원하지 않는
+  것으로 보인다(이 세션이 통제할 수 없는 외부 플랫폼 동작 차이).
+  `build_market_data_and_candidates()`가 `len(closes) < atr_period+1`이면 해당
+  종목을 건너뛰도록 이미 설계돼 있어 파이프라인 자체는 안 죽지만, 20/29종목이
+  누락되면 사실상 랭킹/피라미딩/청산 판단에 쓸 데이터가 거의 남지 않는다.
+- **조치**: `trade_execution_pipeline.py`의 KISClient를 역할별로 분리 -
+  `build_market_data_and_candidates()`는 이제 `quote_client`(환경 인자 없이 생성한
+  기본 KISClient - main.py와 동일하게 `.env`의 전역 ENVIRONMENT를 따름 - EC2에서는
+  production이므로 안정적인 PROD 서버로 감)를 받고, `run_exit_pipeline`/
+  `run_pyramiding_pipeline`/`run_entry_pipeline`(및 `run_trade_execution_cycle`)에는
+  그대로 `order_client`(MIE_TRADE_ENVIRONMENT로 강제된 모의투자 클라이언트)를
+  전달한다. 즉 "시세 조회는 읽기 전용이라 실전 서버를 써도 안전하고 실제로 더
+  안정적", "주문은 절대 실전 서버로 안 나가야 한다"는 두 원칙을 동시에 만족시키는
+  구조로 바꿨다. `__main__` 블록도 두 인스턴스를 각각 생성하도록 수정. 자세한
+  내용은 `trade_execution_pipeline.py` 상단 변경이력 【2026-08-27】(두 번째 항목)
+  참고.
+- **알려진 한계**: `build_market_data_and_candidates()`는 여전히 이 세션이 실제
+  KIS API로 검증할 수 없고, `tests/test_trade_execution_pipeline.py`도 이 함수를
+  커버하지 않는다(MockKISClient가 `get_stock_daily_chart()`를 흉내내지 않음) -
+  다음 EC2 재실행에서 (1) 시세 조회가 다시 대부분 성공하는지(quote_client가 PROD로
+  가는지), (2) 계좌번호 수정 후 `get_balance()`가 정상 동작하는지 함께 확인 필요.
+
 ## 4. 리스크 / 미확정 사항
 - Sector별 PER 중앙값 계산 → **Phase 5-19 완전히 종료(2026-08-24)** -
   마이그레이션/단위테스트/시험(20종목)/전체(2,718종목) 라이브 검증까지

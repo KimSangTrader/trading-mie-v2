@@ -66,6 +66,33 @@ pyramiding/exit_engine) ↔ KIS 주문 API ↔ DB(trade_positions/trading_histor
   안전한 쪽(모의투자)이 되도록 설계했다. 실전 전환은 이 한 줄을 .env에 추가하는
   분명한 결정이 되게 함으로써, 다른 목적(시세 품질)으로 설정된 환경변수에
   실수로 끌려가지 않게 했다.
+
+【2026-08-27】build_market_data_and_candidates()의 시세 조회를 quote_client(PROD)로
+  분리 - __main__ (모의투자 서버 시세 API 불안정 발견)
+- 배경: 위 안전 수정을 반영한 두 번째 EC2 라이브 실행 로그에서, 토큰 발급은
+  정상적으로 모의투자(DEV, openapivts.koreainvestment.com:29443) 서버로 갔지만
+  (안전 수정이 의도대로 작동), get_stock_daily_chart()(개별 종목 일봉 조회,
+  tr_id FHKST03010100)가 총 29종목 중 약 20종목에서 HTTP 500을 반환했다.
+  같은 29종목을 첫 번째 로그(PROD 서버)에서 조회했을 때는 1종목만 실패했다.
+  즉 모의투자 서버가 이 시세 조회 API를 실전 서버만큼 안정적으로 지원하지
+  않는 것으로 보인다(KIS 플랫폼 자체의 동작 차이 - 이 세션의 코드 버그가
+  아니다).
+- 조치: KISClient 하나로 시세 조회와 주문 실행을 둘 다 처리하던 것을, 역할별로
+  분리했다. build_market_data_and_candidates()는 이제 quote_client 인자를 받고
+  (환경 인자 없이 만든 기본 KISClient() - main.py와 동일하게 .env의 전역
+  ENVIRONMENT를 따름 - EC2에서는 production이므로 PROD 서버로 감), 반면
+  run_exit_pipeline/run_pyramiding_pipeline/run_entry_pipeline(및 이들을 묶는
+  run_trade_execution_cycle)에 넘기는 클라이언트는 그대로 order_client
+  (MIE_TRADE_ENVIRONMENT로 강제된 모의투자 클라이언트)를 유지한다. 즉 "시세는
+  읽기 전용이라 실전 서버를 써도 안전하고 실제로 더 안정적"이라는 이유로
+  main.py와 동일한 선택을 했고, "주문은 절대 실전 서버로 안 나가야 한다"는
+  기존 안전 수정은 그대로 유지된다. __main__ 블록도 quote_client/order_client
+  두 인스턴스를 각각 생성하도록 수정했다.
+- 알려진 한계: 이 함수(build_market_data_and_candidates)는 이 세션이 실제
+  KIS API로 검증할 수 없었고(다른 파이프라인 __main__ 블록들과 동일한 한계),
+  기존 tests/test_trade_execution_pipeline.py도 이 함수를 커버하지 않는다
+  (MockKISClient가 get_stock_daily_chart()를 흉내내지 않음) - 사용자 환경에서
+  라이브 재확인이 필요하다.
 ================================================================================
 """
 import logging
@@ -445,9 +472,21 @@ def run_trade_execution_cycle(
     return {"exit": exit_result, "pyramiding": pyramid_result, "entry": entry_result}
 
 
-def build_market_data_and_candidates(session, kis_client, config: TradingConfig = DEFAULT_CONFIG):
+def build_market_data_and_candidates(session, quote_client, config: TradingConfig = DEFAULT_CONFIG):
     """실제 KIS 시세 + DB(StockPriceHistory/StockHierarchicalScore)로
     market_data_by_ticker/ranked_candidates를 조립하는 라이브 배선 헬퍼.
+
+    Args:
+        quote_client: **시세 조회 전용** KISClient. 【2026-08-27 발견, 아래
+            변경이력 참고】모의투자(DEV) 서버는 get_stock_daily_chart() 같은
+            개별 종목 일봉 조회 API를 실전(PROD) 서버만큼 안정적으로 지원하지
+            않는다(사용자의 실제 라이브 실행에서 29종목 중 20종목이 HTTP 500으로
+            실패 - 같은 종목들이 PROD에서는 1종목만 빼고 전부 성공했었음).
+            그래서 이 함수는 반드시 environment="production"(또는 인자 없이
+            생성한 기본 KISClient - main.py와 동일한 설정)으로 만든 클라이언트를
+            받아야 한다. 주문 실행(place_order/get_balance)에 쓰는 클라이언트
+            (모의투자로 강제된 것)와는 별개의 인스턴스여야 한다 - __main__ 블록
+            참고.
 
     【주의】이 함수는 이 세션이 실제 KIS API/RDS로 검증할 수 없었다(다른 파일들의
     __main__ 블록과 동일한 한계 - price_history_pipeline.py 상단 변경이력 참고).
@@ -456,7 +495,7 @@ def build_market_data_and_candidates(session, kis_client, config: TradingConfig 
     환경에서 반드시 라이브 확인이 필요하다.
 
     - 보유 중(OPEN) 포지션 + 최신 계층형 랭킹(StockHierarchicalScore, 상위
-      config.total_candidates개)의 종목마다 kis_client.get_stock_daily_chart()로
+      config.total_candidates개)의 종목마다 quote_client.get_stock_daily_chart()로
       최근 시세를 받아 atr.compute_atr()/exit_engine.compute_lowest_low()를
       계산한다.
     - current_rank/sector_score/theme_score는 최신 StockHierarchicalScore 배치에서
@@ -489,7 +528,7 @@ def build_market_data_and_candidates(session, kis_client, config: TradingConfig 
 
     market_data_by_ticker: Dict[str, Dict[str, Any]] = {}
     for ticker in all_tickers:
-        chart = kis_client.get_stock_daily_chart(ticker, days=config.atr_period + 15)
+        chart = quote_client.get_stock_daily_chart(ticker, days=config.atr_period + 15)
         closes = chart.get("closes") or []
         highs = chart.get("highs") or []
         lows = chart.get("lows") or []
@@ -552,11 +591,23 @@ if __name__ == "__main__":
     print(f"⚠️  매매 실행 환경: {trade_environment} "
           f"({'실전투자 - 진짜 주문' if trade_environment == 'production' else '모의투자'})")
 
+    # 【2026-08-27 추가】시세 조회용 quote_client와 주문 실행용 order_client를
+    # 분리한다. 사용자의 두 번째 라이브 실행 로그에서 모의투자(DEV) 서버가
+    # get_stock_daily_chart()의 약 20/29종목에서 HTTP 500을 반환한 반면(같은
+    # 종목이 PROD에서는 1종목만 실패), 시세 조회는 계속 PROD로 보내는 것이
+    # 안전하고 검증된 경로다. environment 인자 없이 KISClient()를 만들면
+    # main.py와 동일하게 기존 .env의 전역 ENVIRONMENT(=production)를 따르므로
+    # quote_client는 항상 PROD를 향한다. 반면 order_client는 위에서 계산한
+    # trade_environment(기본값 development=모의투자)를 명시적으로 강제해
+    # 실주문은 사용자가 MIE_TRADE_ENVIRONMENT=production을 직접 추가하기 전엔
+    # 절대 실전 서버로 가지 않는다.
+    quote_client = KISClient()
+    order_client = KISClient(environment=trade_environment)
+
     session = SessionLocal()
     try:
-        kis_client = KISClient(environment=trade_environment)
-        market_data_by_ticker, ranked_candidates = build_market_data_and_candidates(session, kis_client)
-        result = run_trade_execution_cycle(session, kis_client, market_data_by_ticker, ranked_candidates)
+        market_data_by_ticker, ranked_candidates = build_market_data_and_candidates(session, quote_client)
+        result = run_trade_execution_cycle(session, order_client, market_data_by_ticker, ranked_candidates)
         print(f"\n청산: {result['exit']}")
         print(f"피라미딩: {result['pyramiding']}")
         print(f"신규진입: {result['entry']}")
