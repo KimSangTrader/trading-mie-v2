@@ -93,6 +93,22 @@ pyramiding/exit_engine) ↔ KIS 주문 API ↔ DB(trade_positions/trading_histor
   기존 tests/test_trade_execution_pipeline.py도 이 함수를 커버하지 않는다
   (MockKISClient가 get_stock_daily_chart()를 흉내내지 않음) - 사용자 환경에서
   라이브 재확인이 필요하다.
+
+【2026-08-28】run_entry_pipeline()에 종목별 제외 사유 로그 추가
+- 배경: 계좌번호/DEV 앱키 문제가 모두 해결된 뒤 처음으로 잔고조회가 성공한
+  라이브 실행에서(예수금 10,000,000원 정상 조회) "신규진입: {'checked': 7,
+  'entered': 0, ...}" 결과가 나왔다. 이번엔 이전처럼 available_cash=0 버그
+  때문이 아니라(실제 예수금이 잡혔으므로) check_entry()/calculate_position()/
+  split_entry_shares()/clip_shares_to_portfolio_risk() 중 어딘가에서 진짜로
+  7종목이 전부 걸러진 것인데, 기존 로그는 "0건 진입"이라는 합계만 보여주고
+  종목별로 왜 걸러졌는지(갭 판정? final/sector/theme 점수 미달? ATR 이상?
+  사이징 결과 0주?) 전혀 보여주지 않아 이게 정상 동작인지 버그인지 사용자가
+  판단할 방법이 없었다.
+- 조치: for candidate in to_consider 루프의 각 continue 분기 직전에
+  logger.info()로 (ticker, action, reason) 또는 실패 지점과 관련 수치를
+  그대로 남기도록 추가했다. 반환값/로직은 전혀 바꾸지 않았다(로그만 추가) -
+  tests/test_trade_execution_pipeline.py 17개 시나리오(fake-ORM 검증) 재확인
+  결과 전부 그대로 통과.
 ================================================================================
 """
 import logging
@@ -396,27 +412,37 @@ def run_entry_pipeline(
 
         action, reason = check_entry(candidate, config)
         if action in ("WAIT", "NO_ENTRY"):
+            # 【2026-08-28 추가】entered=0이 "진짜 필터링"인지 "숨은 버그"인지
+            # 사용자가 로그만 보고 구분할 수 없다는 문제(잔고 버그가 고쳐진 뒤
+            # 처음 나온 진짜 결과)가 있어, 종목별 사유를 반드시 로그에 남긴다.
+            logger.info(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
             continue
 
         entry_price = candidate.get("current_price")
         atr20 = candidate.get("atr20")
         sized = calculate_position(entry_price, atr20, available_cash, config)
         if sized is None:
+            logger.info(f"⏭️  {ticker}: 포지션 사이징 실패(calculate_position=None) - "
+                        f"entry_price={entry_price}, atr20={atr20}, available_cash={available_cash}")
             continue
 
         target_shares = sized["target_shares"]
         if action == "REDUCE":
             target_shares = int(target_shares * config.reduce_position_ratio)
         if target_shares <= 0:
+            logger.info(f"⏭️  {ticker}: target_shares<=0 ({target_shares}) - 사이징 결과 0주")
             continue
 
         first_tranche = split_entry_shares(target_shares, 1, config)
         if first_tranche <= 0:
+            logger.info(f"⏭️  {ticker}: 1차 진입 수량<=0 ({first_tranche}, target_shares={target_shares})")
             continue
 
         risk_per_share = sized["risk_per_share"]
         buy_qty = clip_shares_to_portfolio_risk(first_tranche, risk_per_share, risk_positions, config)
         if buy_qty <= 0:
+            logger.info(f"⏭️  {ticker}: 포트폴리오 리스크 클리핑 후 매수 수량<=0 "
+                        f"(1차수량={first_tranche}, risk_per_share={risk_per_share})")
             continue
 
         order_result = _place_order_or_dry_run(kis_client, dry_run, ticker, "buy", buy_qty)
