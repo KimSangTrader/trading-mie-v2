@@ -412,37 +412,49 @@ def run_entry_pipeline(
 
         action, reason = check_entry(candidate, config)
         if action in ("WAIT", "NO_ENTRY"):
-            # 【2026-08-28 추가】entered=0이 "진짜 필터링"인지 "숨은 버그"인지
-            # 사용자가 로그만 보고 구분할 수 없다는 문제(잔고 버그가 고쳐진 뒤
-            # 처음 나온 진짜 결과)가 있어, 종목별 사유를 반드시 로그에 남긴다.
-            logger.info(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
+            # 【2026-08-28 추가, 같은 날 print()로 교체】entered=0이 "진짜 필터링"인지
+            # "숨은 버그"인지 사용자가 로그만 보고 구분할 방법이 없어 종목별 사유를
+            # 남기기로 했다. 처음엔 logger.info()로 추가했는데, 실제 EC2 라이브
+            # 로그를 확인해보니 이 파일의 logger.info() 호출(이 줄뿐 아니라 기존
+            # run_exit_pipeline/run_pyramiding_pipeline/run_entry_pipeline 끝의
+            # "✅ ... 완료" 요약 줄들도 전부 포함)이 systemd가 캡처하는
+            # /var/log/mie-v2/trade_execution.log에 단 한 번도 찍힌 적이 없다는
+            # 걸 확인했다(이 세션 sandbox에선 동일한 basicConfig 패턴이 정상
+            # 동작해서 원인을 특정하진 못했다 - sqlalchemy/numpy가 없어 실제
+            # 임포트 체인을 그대로 재현할 수 없었음). 반면 kis_client.py의
+            # print() 호출들은 매 실행마다 로그에 빠짐없이 나타나는 걸 확인했으므로,
+            # 원인 규명보다 "사용자가 실제로 로그에서 볼 수 있는 것"을 우선해서
+            # print()로 바꿨다 - 이 파일의 기존 logger.info() 요약 줄들도 같은
+            # 문제를 가지고 있을 가능성이 높지만(별도 확인 필요), 지금 당장
+            # 사용자가 원하는 "왜 0건 진입했는지"부터 해결한다.
+            print(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
             continue
 
         entry_price = candidate.get("current_price")
         atr20 = candidate.get("atr20")
         sized = calculate_position(entry_price, atr20, available_cash, config)
         if sized is None:
-            logger.info(f"⏭️  {ticker}: 포지션 사이징 실패(calculate_position=None) - "
-                        f"entry_price={entry_price}, atr20={atr20}, available_cash={available_cash}")
+            print(f"⏭️  {ticker}: 포지션 사이징 실패(calculate_position=None) - "
+                  f"entry_price={entry_price}, atr20={atr20}, available_cash={available_cash}")
             continue
 
         target_shares = sized["target_shares"]
         if action == "REDUCE":
             target_shares = int(target_shares * config.reduce_position_ratio)
         if target_shares <= 0:
-            logger.info(f"⏭️  {ticker}: target_shares<=0 ({target_shares}) - 사이징 결과 0주")
+            print(f"⏭️  {ticker}: target_shares<=0 ({target_shares}) - 사이징 결과 0주")
             continue
 
         first_tranche = split_entry_shares(target_shares, 1, config)
         if first_tranche <= 0:
-            logger.info(f"⏭️  {ticker}: 1차 진입 수량<=0 ({first_tranche}, target_shares={target_shares})")
+            print(f"⏭️  {ticker}: 1차 진입 수량<=0 ({first_tranche}, target_shares={target_shares})")
             continue
 
         risk_per_share = sized["risk_per_share"]
         buy_qty = clip_shares_to_portfolio_risk(first_tranche, risk_per_share, risk_positions, config)
         if buy_qty <= 0:
-            logger.info(f"⏭️  {ticker}: 포트폴리오 리스크 클리핑 후 매수 수량<=0 "
-                        f"(1차수량={first_tranche}, risk_per_share={risk_per_share})")
+            print(f"⏭️  {ticker}: 포트폴리오 리스크 클리핑 후 매수 수량<=0 "
+                  f"(1차수량={first_tranche}, risk_per_share={risk_per_share})")
             continue
 
         order_result = _place_order_or_dry_run(kis_client, dry_run, ticker, "buy", buy_qty)
