@@ -412,21 +412,21 @@ def run_entry_pipeline(
 
         action, reason = check_entry(candidate, config)
         if action in ("WAIT", "NO_ENTRY"):
-            # 【2026-08-28 추가, 같은 날 print()로 교체】entered=0이 "진짜 필터링"인지
-            # "숨은 버그"인지 사용자가 로그만 보고 구분할 방법이 없어 종목별 사유를
-            # 남기기로 했다. 처음엔 logger.info()로 추가했는데, 실제 EC2 라이브
-            # 로그를 확인해보니 이 파일의 logger.info() 호출(이 줄뿐 아니라 기존
-            # run_exit_pipeline/run_pyramiding_pipeline/run_entry_pipeline 끝의
-            # "✅ ... 완료" 요약 줄들도 전부 포함)이 systemd가 캡처하는
-            # /var/log/mie-v2/trade_execution.log에 단 한 번도 찍힌 적이 없다는
-            # 걸 확인했다(이 세션 sandbox에선 동일한 basicConfig 패턴이 정상
-            # 동작해서 원인을 특정하진 못했다 - sqlalchemy/numpy가 없어 실제
-            # 임포트 체인을 그대로 재현할 수 없었음). 반면 kis_client.py의
-            # print() 호출들은 매 실행마다 로그에 빠짐없이 나타나는 걸 확인했으므로,
-            # 원인 규명보다 "사용자가 실제로 로그에서 볼 수 있는 것"을 우선해서
-            # print()로 바꿨다 - 이 파일의 기존 logger.info() 요약 줄들도 같은
-            # 문제를 가지고 있을 가능성이 높지만(별도 확인 필요), 지금 당장
-            # 사용자가 원하는 "왜 0건 진입했는지"부터 해결한다.
+            # 【2026-08-28 추가, print()로 작성】entered=0이 "진짜 필터링"인지 "숨은
+            # 버그"인지 사용자가 로그만 보고 구분할 방법이 없어 종목별 사유를 남기기로
+            # 했다. kis_client.py가 이미 print()로 안정적으로 로그를 남기고 있어서
+            # 같은 방식을 따랐다.
+            # 【2026-08-31 정정】당시엔 "logger.info()가 로그 파일에 전혀 안 찍힌다"고
+            # (잘못) 결론 내렸었는데, 2026-08-31 00:05 라이브 로그를 다시 보니 실제
+            # 원인은 그게 아니라 **stdout 블록 버퍼링으로 인한 순서 뒤섞임**이었다 -
+            # print()가 파일로 리다이렉트되면 버퍼링돼 한참 늦게(또는 프로세스 종료
+            # 시점에) flush되는 반면, logging의 기본 StreamHandler(stderr)는 즉시
+            # flush되어, 실제로는 나중에 실행된 logger.info() 줄이 로그 파일에는 더
+            # 먼저 찍히는 것처럼 보였다(tail -100/-150으로 볼 때 원하는 줄이 있는
+            # 근처가 아니었을 뿐 - 아예 안 찍힌 게 아니었음). 근본 수정은
+            # deploy/*.service 전체에 Environment="PYTHONUNBUFFERED=1"을 추가하는
+            # 것으로 처리(각 서비스 파일 변경이력 참고) - 이 print() 문들은 여전히
+            # 유효하고 정상 동작하므로 되돌리지 않는다.
             print(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
             continue
 

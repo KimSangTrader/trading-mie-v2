@@ -14,3 +14,8 @@ ExecStart=/opt/mie-v2/venv/bin/python -m data.krx_importer
 StandardOutput=append:/var/log/mie-v2/krx_import.log
 StandardError=append:/var/log/mie-v2/krx_import.log
 Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 【2026-08-31 추가】stdout 블록 버퍼링 때문에 로그 파일에 실행 순서가 뒤섞여
+# 찍히는 문제가 mie-v2-trade-execution.service에서 실측 확인돼(자세한 경위는
+# 그 서비스 파일 변경이력 참고), 같은 패턴(print+logging 혼용, StandardOutput을
+# 파일로 append)을 쓰는 이 서비스에도 예방적으로 동일하게 적용한다.
+Environment="PYTHONUNBUFFERED=1"
