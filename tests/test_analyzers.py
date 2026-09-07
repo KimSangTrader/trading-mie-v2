@@ -4,7 +4,6 @@ from market_intelligence.analyzers import (
     SectorAnalyzer,
     MoneyFlowAnalyzer,
     ThemeAnalyzer,
-    NewsAnalyzer,
     TechnicalAnalyzer,
     ValuationAnalyzer
 )
@@ -87,14 +86,6 @@ class TestThemeAnalyzer:
         assert analyzer.name == "theme"
         assert analyzer.weight == 0.14
 
-class TestNewsAnalyzer:
-    """NewsAnalyzer 테스트"""
-    
-    def test_initialization(self):
-        analyzer = NewsAnalyzer()
-        assert analyzer.name == "news"
-        assert analyzer.weight == 0.09
-
 class TestTechnicalAnalyzer:
     """TechnicalAnalyzer 테스트"""
     
@@ -116,10 +107,15 @@ class TestAllAnalyzers:
     
     def test_all_analyzers_weight_sum(self):
         """【2026-08-13 수정】weight 합 테스트 로직 변경
-        
+        【2026-09-07 수정】NewsAnalyzer 관련 assertion 제거 - 실제 제거 배경은
+        market_intelligence/analyzers/__init__.py 변경이력(Phase 5-20) 참고.
+        당시 changelog에 "tests/test_analyzers.py의 NewsAnalyzer 관련 테스트
+        삭제"라고 이미 예고돼 있었는데 이 파일엔 반영이 안 돼 있었다 - main.py
+        의존성 파일들을 EC2/GitHub에 재배포하면서 함께 정리.
+
         이전: 합 = 1.00
-        현재: 합 = 1.12 (MarketAnalyzer 0.30 반영)
-        
+        현재: 합 = 1.03 (MarketAnalyzer 0.30 반영, NewsAnalyzer 0.09 제거)
+
         변경 사항:
         - TechnicalAnalyzer: 0.18
         - MarketAnalyzer: 0.30 (변경됨)
@@ -127,10 +123,9 @@ class TestAllAnalyzers:
         - SectorAnalyzer: 0.18
         - MoneyFlowAnalyzer: 0.14
         - ThemeAnalyzer: 0.14
-        - NewsAnalyzer: 0.09
         ────────────────────────────
-        합계: 1.12 (1.0 초과, 의도적 중복 가중치)
-        
+        합계: 1.03 (1.0 초과, 의도적 중복 가중치)
+
         참고: Phase 4에서 AdvancedCombinedAnalyzer는
         TechnicalAnalyzer(35%) + MarketAnalyzer(35%) + ValuationAnalyzer(30%)
         로 자체 정규화하므로, 개별 analyzer의 weight 합이 1.0일 필요 없음
@@ -140,12 +135,11 @@ class TestAllAnalyzers:
             SectorAnalyzer(),
             MoneyFlowAnalyzer(),
             ThemeAnalyzer(),
-            NewsAnalyzer(),
             TechnicalAnalyzer(),
             ValuationAnalyzer()
         ]
         total_weight = sum(a.weight for a in analyzers)
-        
+
         # 정보 출력 (테스트는 통과)
         print(f"\n【전체 Analyzer Weight 합】")
         print(f"  TechnicalAnalyzer: 0.18")
@@ -154,7 +148,6 @@ class TestAllAnalyzers:
         print(f"  SectorAnalyzer: 0.18")
         print(f"  MoneyFlowAnalyzer: 0.14")
         print(f"  ThemeAnalyzer: 0.14")
-        print(f"  NewsAnalyzer: 0.09")
         print(f"  ────────────────────────────")
         print(f"  합계: {total_weight:.2f}")
         print(f"\n  참고: Phase 4의 AdvancedCombinedAnalyzer는")
@@ -176,11 +169,10 @@ class TestAllAnalyzers:
             SectorAnalyzer(),
             MoneyFlowAnalyzer(),
             ThemeAnalyzer(),
-            NewsAnalyzer(),
             TechnicalAnalyzer(),
             ValuationAnalyzer()
         ]
-        
+
         # 모든 analyzer가 실행 가능해야 함
         for analyzer in analyzers:
             assert hasattr(analyzer, 'run'), f"{analyzer.name}에 run() 메서드 필요"

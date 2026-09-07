@@ -9,6 +9,8 @@ ValuationPipeline 테스트 (Phase 5-7: 수집→중앙값→상대평가→DB �
   SQLite in-memory DB로 파이프라인 전체 흐름(수집→중앙값→상대평가→저장)을 검증한다.
 - 이 세션엔 sqlalchemy가 설치되어 있지 않아(PyPI 네트워크 차단) 실행하지 못했다.
   사용자 컴퓨터에서 pytest tests/test_valuation_pipeline.py -v 로 확인 필요.
+
+【2026-08-24】Phase 5-19: Sector별 중앙값 반영 검증 추가
 ================================================================================
 """
 
@@ -168,3 +170,72 @@ class TestValuationPipelineEndToEnd:
         # KOSPI 종목의 시장 기준값이 KOSDAQ 종목 값(PER=30)으로 오염되면 안 됨
         row_kospi = session.query(StockValuation).filter_by(ticker="005930").one()
         assert float(row_kospi.market_per) == pytest.approx(18.0)  # (15.0+21.0)/2
+
+
+def _sector_row(ticker, sector):
+    return {"ticker": ticker, "name": "종목", "market": "KOSPI", "sector": sector, "needs_review": False}
+
+
+class TestValuationPipelineSectorMedians:
+    def test_sector_mapping_populates_sector_columns(self, session):
+        stocks = [_stock(f"{i:06d}") for i in range(1, 7)]  # 6종목, 5개면 표본 충분(기본 임계값)
+        responses = {
+            f"{i:06d}": {"per": 10.0 + i, "pbr": 1.0 + i * 0.1, "dividend_yield": 1.0 + i * 0.05}
+            for i in range(1, 7)
+        }
+        sector_mapping = [_sector_row(f"{i:06d}", "반도체") for i in range(1, 7)]
+
+        result = run_full_valuation_pipeline(
+            session,
+            stock_master=MockStockMaster(stocks),
+            collector=MockValuationCollector(responses),
+            sector_mapping=sector_mapping,
+        )
+
+        assert "반도체" in result["sector_medians"]
+        row = session.query(StockValuation).filter_by(ticker="000001").one()
+        assert row.sector == "반도체"
+        assert row.sector_per_median is not None
+        # market_per(시장 전체 중앙값)은 sector 컬럼과 별개로 계속 채워져야 함
+        assert row.market_per is not None
+
+    def test_sector_with_too_few_stocks_leaves_sector_columns_null(self, session):
+        # 표본 부족(기본 임계값 5 미만) - Sector 컬럼은 NULL로 남아야 함(시장값으로
+        # 대신 채우지 않음 - main.py의 get_latest_stock_valuations()가 이 NULL로
+        # StockAnalyzer의 자동 fallback을 살리기 때문)
+        stocks = [_stock("005930"), _stock("000660")]
+        responses = {
+            "005930": {"per": 15.2, "pbr": 1.4, "dividend_yield": 2.5},
+            "000660": {"per": 21.6, "pbr": 2.1, "dividend_yield": 0.9},
+        }
+        sector_mapping = [_sector_row("005930", "반도체"), _sector_row("000660", "반도체")]
+
+        run_full_valuation_pipeline(
+            session,
+            stock_master=MockStockMaster(stocks),
+            collector=MockValuationCollector(responses),
+            sector_mapping=sector_mapping,
+        )
+
+        row = session.query(StockValuation).filter_by(ticker="005930").one()
+        assert row.sector == "반도체"
+        assert row.sector_per_median is None
+        assert row.market_per is not None
+
+    def test_no_sector_mapping_behaves_like_before(self, session):
+        # sector_mapping을 안 주고, DB에도 StockSectorMapping이 없으면(빈 세션)
+        # get_latest_sector_mapping()이 빈 리스트를 돌려주고 기존 동작과 동일해야 함
+        stocks = [_stock("005930")]
+        responses = {"005930": {"per": 15.2, "pbr": 1.4, "dividend_yield": 2.5}}
+
+        result = run_full_valuation_pipeline(
+            session,
+            stock_master=MockStockMaster(stocks),
+            collector=MockValuationCollector(responses),
+        )
+
+        assert result["sector_medians"] == {}
+        row = session.query(StockValuation).filter_by(ticker="005930").one()
+        assert row.sector is None
+        assert row.sector_per_median is None
+        assert row.market_per is not None

@@ -46,6 +46,7 @@ class TestStockValuationSchema:
             "id", "timestamp", "ticker", "market",
             "per", "pbr", "dividend_yield",
             "market_per", "market_pbr", "market_dividend_yield",
+            "sector", "sector_per_median", "sector_pbr_median", "sector_dividend_median",
             "per_relative_score", "pbr_relative_score", "dividend_relative_score",
             "valuation_score", "data_quality", "data_source",
             "created_at",
@@ -119,3 +120,36 @@ class TestStockValuationRoundTrip:
         rows = session.query(StockValuation).filter_by(timestamp=ts).all()
         assert len(rows) == 2
         assert {r.ticker for r in rows} == {"005930", "000660"}
+
+    def test_sector_median_columns_round_trip(self, session):
+        # 【2026-08-24, Phase 5-19】Sector 밸류에이션 중앙값 컬럼 - 기존 market_per 등과
+        # 별도로 저장되고, 안 채워지면 NULL로 남아야 한다(기본값으로 0/시장값이 아님)
+        row_with_sector = StockValuation(
+            ticker="005930", market="KOSPI",
+            market_per=Decimal("18.40"), market_pbr=Decimal("1.72"), market_dividend_yield=Decimal("2.05"),
+            sector="반도체",
+            sector_per_median=Decimal("16.10"), sector_pbr_median=Decimal("1.55"),
+            sector_dividend_median=Decimal("1.90"),
+            valuation_score=Decimal("60.0"),
+        )
+        row_without_sector = StockValuation(
+            ticker="000660", market="KOSPI",
+            market_per=Decimal("18.40"), market_pbr=Decimal("1.72"), market_dividend_yield=Decimal("2.05"),
+            valuation_score=Decimal("55.0"),
+        )
+        session.add_all([row_with_sector, row_without_sector])
+        session.commit()
+
+        fetched = session.query(StockValuation).filter_by(ticker="005930").one()
+        assert fetched.sector == "반도체"
+        assert float(fetched.sector_per_median) == 16.10
+        assert float(fetched.sector_pbr_median) == 1.55
+        assert float(fetched.sector_dividend_median) == 1.90
+        # market_per 등 기존 컬럼은 sector 컬럼과 별개로 그대로 남아있어야 함
+        assert float(fetched.market_per) == 18.40
+
+        fetched_no_sector = session.query(StockValuation).filter_by(ticker="000660").one()
+        assert fetched_no_sector.sector is None
+        assert fetched_no_sector.sector_per_median is None
+        assert fetched_no_sector.sector_pbr_median is None
+        assert fetched_no_sector.sector_dividend_median is None

@@ -1,6 +1,25 @@
 """
 기술 지표 계산 유틸리티
 MACD, RSI, 볼린저밴드, 이동평균
+
+================================================================================
+【변경 이력】
+================================================================================
+【2026-08-23】calculate_rsi() 반환값을 float()로 감쌈 (Phase 5-17 라이브 검증 중 발견)
+- 배경: 이 함수는 원래 numpy 배열 연산(up/down이 np.float64)을 그대로 반환해서
+  타입 힌트("-> float")와 달리 실제로는 numpy.float64를 돌려주고 있었다. 지금까지는
+  이 값이 print/로그 출력에만 쓰여서 문제가 드러나지 않았는데, 이번에 StockAnalyzer가
+  이 값을 계층형 순위 점수 계산에 쓰고 그 결과를 stock_hierarchical_scores 테이블에
+  INSERT하면서 처음으로 psycopg2가 np.float64를 SQL 파라미터로 못 받아 에러가 났다
+  (에러 메시지가 `np.float64(...)`를 스키마명으로 잘못 파싱해서 `schema "np" does not
+  exist`로 나옴 - 실제 원인은 numpy 타입임). 근본 원인(여기)에서 한 번 고치고,
+  market_intelligence/collectors/hierarchical_ranking_pipeline.py의 DB 저장
+  경계에서도 방어적으로 float() 캐스팅을 추가해 다른 경로로 numpy 타입이 새어
+  들어와도 막는다. calculate_ema/calculate_macd/calculate_bollinger_bands/
+  calculate_moving_averages도 내부적으로 np.mean/np.std를 쓰는 건 동일하지만, 이번
+  세션에서 실제로 DB INSERT까지 이어지는 경로는 calculate_rsi뿐이라 나머지는
+  건드리지 않았다 - 라이브 검증 중 비슷한 에러가 나면 같은 패턴으로 고치면 된다.
+================================================================================
 """
 
 import numpy as np
@@ -66,8 +85,8 @@ class TechnicalIndicators:
         
         rs = up / down if down != 0 else 0
         rsi = 100 - (100 / (1 + rs)) if rs >= 0 else 0
-        
-        return rsi
+
+        return float(rsi)
     
     @staticmethod
     def calculate_bollinger_bands(prices: List[float], period: int = 20, std_dev: float = 2) -> Dict:
