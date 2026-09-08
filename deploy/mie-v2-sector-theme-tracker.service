@@ -1,0 +1,15 @@
+[Unit]
+Description=MIE V2.0 Sector/Theme 일별 점수 분포 기록 (계층형 스케일링 재조정 판단용 데이터 누적)
+# 【2026-09-08】최초 생성 - daily_sector_theme_tracker.py 변경이력 참고.
+# main.py serve(평일 19:00 KST 목표)가 남긴 로그를 읽기만 하는 조회 전용 스크립트라
+# mie-v2.service와 독립적으로 실행해도 안전하다 (DB/API 접근 없음).
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+ExecStart=/opt/mie-v2/venv/bin/python3 /opt/mie-v2/daily_sector_theme_tracker.py
+StandardOutput=append:/var/log/mie-v2/sector_theme_tracker.log
+StandardError=append:/var/log/mie-v2/sector_theme_tracker.log
+Environment="PYTHONUNBUFFERED=1"

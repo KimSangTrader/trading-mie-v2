@@ -1,0 +1,12 @@
+[Unit]
+Description=매일 07:30 KST(=22:30 UTC, EC2 시스템 시각 기준) Sector/Theme 기록 실행
+# 19:00 KST 목표로 도는 mie-v2.service 배치가 완료된 뒤 + 다음날 09:05 KST
+# mie-v2-trade-execution.service보다 먼저 돌도록 여유를 뒀다(약 1.5시간 버퍼).
+# EC2 시스템 시각이 UTC임을 `date` 명령으로 확인했음(2026-09-07/08 세션).
+
+[Timer]
+OnCalendar=*-*-* 22:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
