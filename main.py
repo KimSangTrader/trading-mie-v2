@@ -61,7 +61,9 @@ Valuation)를 등록하고, market_data 대부분(섹터/수급/테마/뉴스/�
   * 상시 프로세스로 계속 떠있으면서(A안), 그 안에서 자체적으로 일정을
     관리하는 방식을 선택함 (systemd timer 같은 외부 스케줄러 대신).
   * 한국 주식 "일마감 분석"(전종목 스크리닝)은 평일 KST 19:00에 하루
-    한 번만 실행 - 실시간 매수/매도 자동주문 루프(별도 프로세스, 이번
+    한 번만 실행(2026-09-14: 한국 주식시장 거래시간 변경에 따라 22:00로
+    조정 - 아래 【2026-09-14】 항목 참고) - 실시간 매수/매도 자동주문
+    루프(별도 프로세스, 이번
     범위 아님 - "지금은 일마감 분석을 고도화 하는 단계이니 실제 대상건의
     매입/매도는 분석작업이 완료된 이후 진행하자")와는 완전히 분리된
     별개 프로세스. 최종적으로는 두 프로세스가 하나의 "무중단 자동매매
@@ -73,8 +75,8 @@ Valuation)를 등록하고, market_data 대부분(섹터/수급/테마/뉴스/�
     TechnicalAnalyzer/get_real_market_data()가 공유(예전엔 이 셋이
     각자 별도 KISClient를 만들어 사이클마다 토큰을 3번씩 새로 받았음).
   * 재기동(다운타임 후) 복구 로직: data/state/main_run_state.json에
-    마지막 완료 날짜를 기록해두고, (a) 오늘 아직 미완료 + 이미 19시가
-    지났으면 즉시 실행, (b) 어제치도 없이 하루 이상 밀렸으면 시각과
+    마지막 완료 날짜를 기록해두고, (a) 오늘 아직 미완료 + 이미 목표
+    시각이 지났으면 즉시 실행, (b) 어제치도 없이 하루 이상 밀렸으면 시각과
     무관하게 즉시 실행(따라잡기), (c) 오늘 이미 완료면 다음날까지 대기.
   * 주말(토/일)은 건너뜀 - KRX 공휴일까지는 아직 처리 못함(알려진 한계,
     추후 과제).
@@ -230,6 +232,23 @@ Valuation)를 등록하고, market_data 대부분(섹터/수급/테마/뉴스/�
   valuation_pipeline.py를 한 번 돌려 stock_valuation에 sector_per_median 등이 실제로
   채워지는지 (4) python main.py(시험)로 Step 8 밸류에이션 컴포넌트가 여전히 정상
   범위인지.
+
+【2026-09-14】일마감 분석 목표 시각 19:00 -> 22:00(KST) 변경
+- 배경: 한국 주식시장 거래시간이 변경되었다는 사용자 고지에 따라, 일마감
+  분석(전종목 스크리닝)을 시작하는 목표 시각을 평일 KST 19:00에서 22:00로
+  조정한다. 이 시각 값(19:00, 22:00 모두)은 코드가 임의로 정한 게 아니라
+  전부 사용자 지정값이다.
+- 변경: _DAILY_RUN_HOUR을 19 -> 22로 변경(_DAILY_RUN_MINUTE=0은 그대로).
+  _should_run_now()/run_forever() 등 이 상수를 참조하는 로직 자체는 값만
+  바뀔 뿐 그대로 동작(다운타임 후 따라잡기 로직, 주말 스킵 등 변경 없음).
+- ⚠️ 후속 확인 필요(이번 변경에서는 건드리지 않음): (1)
+  deploy/mie-v2-sector-theme-tracker.timer(현재 22:30 UTC = 07:30 KST 실행)가
+  분석 시작 시각이 늦춰진 뒤에도 분석 완료 이후 & 09:05 KST 매매집행 이전이라는
+  여유를 여전히 확보하는지 재검토 필요 (2)
+  mie-v2-trade-execution.service/.timer의 09:05 KST 실행 시각이 22:00 KST
+  시작 기준으로도 분석이 안정적으로 먼저 끝나는지 재검토 필요(과거 완료
+  소요시간은 정상 시 2시간 이내~수 시간, OOM 장애 시기엔 24시간 이상 걸린
+  전례가 있어 여유가 빠듯할 수 있음).
 ================================================================================
 """
 
@@ -296,7 +315,9 @@ _TECHNICAL_FETCH_RATE_LIMIT_SEC = 0.2
 
 # ============ 상시 서비스 모드(serve) 설정 ============
 KST = ZoneInfo("Asia/Seoul")
-_DAILY_RUN_HOUR = 19    # 일마감 분석 목표 시각(KST) - 사용자 지정
+# 2026-09-14: 한국 주식시장 거래시간 변경에 따라 19:00 -> 22:00(KST)로 조정
+# (사용자 고지 - 아래 changelog 【2026-09-14】 항목 참고)
+_DAILY_RUN_HOUR = 22    # 일마감 분석 목표 시각(KST) - 사용자 지정
 _DAILY_RUN_MINUTE = 0
 _SCHEDULER_CHECK_INTERVAL_SECONDS = 60  # 상시 루프에서 "지금 실행해야 하나" 체크 주기
 _STATE_FILE = Path(__file__).resolve().parent / "data" / "state" / "main_run_state.json"
@@ -936,8 +957,8 @@ def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
     - 마지막 완료일이 오늘이면 -> 이미 끝났으니 대기
     - 마지막 완료일이 어제보다도 이전이면(하루 이상 밀림) -> 목표 시각과
       무관하게 즉시 실행 (다운타임 복구/따라잡기)
-    - 그 외(마지막 완료일이 어제, 오늘 몫만 밀림) -> 오늘 목표 시각(19:00
-      KST)이 지났으면 실행
+    - 그 외(마지막 완료일이 어제, 오늘 몫만 밀림) -> 오늘 목표 시각(22:00
+      KST, 2026-09-14부터 - 이전엔 19:00)이 지났으면 실행
     """
     if now_kst.weekday() >= 5:  # 5=토요일, 6=일요일
         return False
@@ -966,7 +987,7 @@ def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
         )
         return True
 
-    # last_date == yesterday: 오늘 몫만 밀린 상태 - 목표 시각(19:00) 이후인지 확인
+    # last_date == yesterday: 오늘 몫만 밀린 상태 - 목표 시각(22:00) 이후인지 확인
     target = now_kst.replace(hour=_DAILY_RUN_HOUR, minute=_DAILY_RUN_MINUTE, second=0, microsecond=0)
     return now_kst >= target
 
@@ -984,7 +1005,7 @@ def run_forever():
     """상시 서비스 모드 - systemd(mie-v2.service, ExecStart를 `python main.py serve`로
     변경 필요)가 이 함수를 실행한다.
 
-    평일 KST 19:00에 하루 한 번 전체 종목(all) 분석 사이클을 실행하고, 완료
+    평일 KST 22:00(2026-09-14부터 - 이전엔 19:00)에 하루 한 번 전체 종목(all) 분석 사이클을 실행하고, 완료
     시각을 data/state/main_run_state.json에 기록한다. 그 외 시간에는 프로세스가
     종료하지 않고 60초 간격으로 "지금 실행해야 하나"만 체크하며 대기한다
     (_should_run_now 참고 - 다운타임 후 재기동 시 따라잡기 로직 포함).
@@ -997,7 +1018,7 @@ def run_forever():
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     logger.info("=" * 80)
-    logger.info("🎊 MIE V2.0 - 상시 서비스 모드 시작 (일마감 분석, 평일 19:00 KST)")
+    logger.info("🎊 MIE V2.0 - 상시 서비스 모드 시작 (일마감 분석, 평일 22:00 KST)")
     logger.info("=" * 80)
 
     manager, analyzers, kis_client = setup_manager_and_client()
