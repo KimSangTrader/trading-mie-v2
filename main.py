@@ -257,7 +257,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -949,16 +949,49 @@ def _save_run_state(completed_date: str) -> None:
     _STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _previous_business_day(d: date) -> date:
+    """d 기준 "그 전 영업일"(토/일 건너뜀)을 반환한다 - 월요일이면 그 전 금요일.
+
+    2026-09-22 버그 수정으로 신규 추가(아래 _should_run_now() 변경이력 참고).
+    공휴일은 여전히 고려하지 않는다(알려진 한계, 기존과 동일)."""
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:  # 5=토요일, 6=일요일
+        prev -= timedelta(days=1)
+    return prev
+
+
 def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
     """일마감 분석을 지금 실행해야 하는지 판단한다.
 
     - 주말(토/일)은 건너뛴다 (KRX 휴장 - 공휴일은 아직 처리 못함, 알려진 한계)
     - 마지막 완료 기록이 아예 없으면(최초 실행) -> 즉시 실행
     - 마지막 완료일이 오늘이면 -> 이미 끝났으니 대기
-    - 마지막 완료일이 어제보다도 이전이면(하루 이상 밀림) -> 목표 시각과
-      무관하게 즉시 실행 (다운타임 복구/따라잡기)
-    - 그 외(마지막 완료일이 어제, 오늘 몫만 밀림) -> 오늘 목표 시각(22:00
-      KST, 2026-09-14부터 - 이전엔 19:00)이 지났으면 실행
+    - 마지막 완료일이 "그 전 영업일"보다도 이전이면(진짜 하루 이상 밀림) ->
+      목표 시각과 무관하게 즉시 실행 (다운타임 복구/따라잡기)
+    - 그 외(마지막 완료일이 그 전 영업일, 오늘 몫만 밀림) -> 오늘 목표
+      시각(22:00 KST, 2026-09-14부터 - 이전엔 19:00)이 지났으면 실행
+
+    【2026-09-22】"매주 월요일마다 지난 금요일 데이터로 잘못 캐치업" 버그 수정
+    - 배경: 9/14, 9/21 두 번 다 월요일 00:25 KST 무렵 "완료" 기록이 남았는데,
+      Sector/Theme Analysis 로그를 확인해보니 직전 금요일과 소수점까지 완전히
+      동일한 수치였다 - 진짜 월요일 장 데이터가 아니라 캐치업 로직이 금요일치
+      데이터를 그대로 재사용해 돌린 것이었다.
+    - 원인: 기존 코드는 "어제"를 항상 `now_kst - timedelta(days=1)`로 계산했다.
+      주말은 건너뛰므로 last_completed_date는 늘 "지난 금요일"인 채로 토/일을
+      넘기는데, 월요일 자정이 되는 순간 `어제(일요일) - last_date(금요일)`가
+      항상 2일 이상 벌어져 "다운타임으로 하루 이상 밀렸다"는 캐치업 조건이
+      매주 월요일 00:00 KST 직후 첫 체크에서 무조건 참이 됐다. 그 시각엔
+      당연히 그날(월요일) 장 데이터가 아직 없으므로 금요일 종가 그대로
+      계산되고, 그 결과가 "오늘(월요일) 완료"로 기록되면서 정작 그날 저녁
+      22:00 목표 시각의 진짜 월요일 마감 분석은 영영 스킵됐다(매주 반복되는
+      구조적 문제 - 지난주 9/14 사고는 스케줄 전환 과정의 우연이 아니라 이
+      버그가 매주 발생하고 있었던 것).
+    - 수정: "어제" 대신 "그 전 영업일"(_previous_business_day() - 주말
+      건너뛰고 계산) 기준으로 판정하도록 변경. 이제 월요일엔 last_date가
+      금요일이면 "그 전 영업일과 일치"로 취급되어 정상적으로 22:00 목표
+      시각까지 대기했다가 그날 진짜 데이터로 실행한다. 다운타임이 실제로
+      1영업일 이상 밀린 경우(예: 화요일인데 last_date가 지난주 금요일)는
+      여전히 즉시 캐치업된다 - 이 부분 동작은 그대로 유지.
     """
     if now_kst.weekday() >= 5:  # 5=토요일, 6=일요일
         return False
@@ -977,17 +1010,18 @@ def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
     except ValueError:
         last_date = None
 
-    yesterday = (now_kst - timedelta(days=1)).date()
+    prev_business_day = _previous_business_day(now_kst.date())
 
-    if last_date is None or last_date < yesterday:
-        # 이틀 이상 밀렸거나(다운타임이 길었음) 날짜 파싱 실패 - 즉시 따라잡기
+    if last_date is None or last_date < prev_business_day:
+        # 진짜로 영업일 기준 하루 이상 밀렸거나(다운타임이 길었음) 날짜 파싱
+        # 실패 - 즉시 따라잡기
         logger.warning(
             f"⚠️  마지막 완료일({last_completed_date})이 오래되어 목표 시각과 무관하게 "
             f"즉시 분석을 진행합니다"
         )
         return True
 
-    # last_date == yesterday: 오늘 몫만 밀린 상태 - 목표 시각(22:00) 이후인지 확인
+    # last_date == prev_business_day: 오늘 몫만 밀린 상태(정상) - 목표 시각(22:00) 이후인지 확인
     target = now_kst.replace(hour=_DAILY_RUN_HOUR, minute=_DAILY_RUN_MINUTE, second=0, microsecond=0)
     return now_kst >= target
 
