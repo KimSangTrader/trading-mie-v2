@@ -289,6 +289,7 @@ from market_intelligence.analyzers import (
     ValuationAnalyzer
 )
 from data.kis_client import KISClient
+from data.krx_calendar import is_krx_trading_day
 # 【2026-08-23 추가, Phase 5-17】계층형 순위(시장→Sector→Theme→종목) 배선.
 # SectorAnalyzer/ThemeAnalyzer는 더 이상 여기서 직접 등록/호출하지 않는다 - Phase 2에서
 # "종목별 market_data" 계약을 버리고 "전체 종목 price_history+mapping" 계약으로 바뀌어서,
@@ -950,12 +951,14 @@ def _save_run_state(completed_date: str) -> None:
 
 
 def _previous_business_day(d: date) -> date:
-    """d 기준 "그 전 영업일"(토/일 건너뜀)을 반환한다 - 월요일이면 그 전 금요일.
+    """d 기준 "그 전 실제 거래일"(주말+공휴일 모두 건너뜀)을 반환한다 -
+    월요일이면 그 전 금요일, 명절 연휴 다음날이면 연휴 전 마지막 거래일.
 
-    2026-09-22 버그 수정으로 신규 추가(아래 _should_run_now() 변경이력 참고).
-    공휴일은 여전히 고려하지 않는다(알려진 한계, 기존과 동일)."""
+    2026-09-22 버그 수정으로 신규 추가(아래 _should_run_now() 변경이력 참고),
+    2026-09-29 공휴일까지 고려하도록 확장(data.krx_calendar.is_krx_trading_day()
+    사용 - 마찬가지로 아래 _should_run_now() 변경이력 참고)."""
     prev = d - timedelta(days=1)
-    while prev.weekday() >= 5:  # 5=토요일, 6=일요일
+    while not is_krx_trading_day(prev):
         prev -= timedelta(days=1)
     return prev
 
@@ -963,7 +966,8 @@ def _previous_business_day(d: date) -> date:
 def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
     """일마감 분석을 지금 실행해야 하는지 판단한다.
 
-    - 주말(토/일)은 건너뛴다 (KRX 휴장 - 공휴일은 아직 처리 못함, 알려진 한계)
+    - 주말+공휴일(KRX 실제 휴장일 전체)은 건너뛴다 (2026-09-29부터 -
+      data.krx_calendar.is_krx_trading_day() 사용, 아래 변경이력 참고)
     - 마지막 완료 기록이 아예 없으면(최초 실행) -> 즉시 실행
     - 마지막 완료일이 오늘이면 -> 이미 끝났으니 대기
     - 마지막 완료일이 "그 전 영업일"보다도 이전이면(진짜 하루 이상 밀림) ->
@@ -992,8 +996,29 @@ def _should_run_now(state: Dict[str, Any], now_kst: datetime) -> bool:
       시각까지 대기했다가 그날 진짜 데이터로 실행한다. 다운타임이 실제로
       1영업일 이상 밀린 경우(예: 화요일인데 last_date가 지난주 금요일)는
       여전히 즉시 캐치업된다 - 이 부분 동작은 그대로 유지.
+
+    【2026-09-29】공휴일도 실제 거래일 판정에 포함(주말만 건너뛰던 한계 해소)
+    - 배경: 2026-09-24~25 추석 연휴 이틀 다 KRX가 쉬었는데도, 이 함수는 그때까지
+      "토/일만 아니면 평일"로 판단해 정상적으로 22:00 목표 시각에 일마감 분석을
+      그대로 돌렸다. 그 시각엔 KRX가 새 시세를 발행하지 않았으니 직전 실제
+      거래일(9/23)과 완전히 동일한 Sector/Theme 점수가 나왔고, 그 결과가 각각
+      "9/24 완료" "9/25 완료"로 기록되면서 daily_sector_theme_tracker.py CSV에
+      의미 없는 중복 행이 이틀치 쌓였다(사용자가 추석 연휴였음을 확인해줌 -
+      코드 버그가 아니라 애초에 "휴장일은 분석을 안 해도 된다"는 처리 자체가
+      없었던 것).
+    - 수정: 주말 판정(now_kst.weekday() >= 5)을
+      data.krx_calendar.is_krx_trading_day()로 교체 - 이 캘린더는 주말은 물론
+      설날/추석/근로자의날/대체공휴일/KRX 자체 휴장일(12/31)까지 포함한다(직접
+      만든 공휴일 목록이 아니라 pandas_market_calendars 'XKRX' 캘린더 사용 -
+      data/krx_calendar.py 모듈 docstring 참고). _previous_business_day()도
+      같은 함수를 쓰도록 함께 바꿔서, 연휴 다음 첫 거래일이 "그 전 영업일"을
+      연휴 전 마지막 실제 거래일로 올바르게 계산하게 된다(예: 10/5 개천절
+      대체공휴일 다음 거래일인 10/6은 _previous_business_day가 10/2를 가리킨다).
+    - 이미 기록된 9/24, 9/25의 중복 데이터는 소급 정정하지 않는다(과거 배치
+      이력은 그대로 두는 기존 방침과 동일 - stock_sector_mapping 등과 같은
+      맥락) - 이번 수정은 앞으로의 재발만 막는다.
     """
-    if now_kst.weekday() >= 5:  # 5=토요일, 6=일요일
+    if not is_krx_trading_day(now_kst.date()):
         return False
 
     last_completed_date = state.get("last_completed_date")

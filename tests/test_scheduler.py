@@ -10,6 +10,12 @@
   자정 직후 첫 체크에서 `last_completed_date(금요일)` vs `어제(일요일)` 비교가
   매주 무조건 "하루 이상 밀림"으로 오판정되던 것이 원인이었다(main.py 변경이력
   【2026-09-22】 항목 참고). 이 테스트는 그 버그가 재발하지 않는지 고정한다.
+【2026-09-29】추석 연휴(공휴일) 케이스 추가 - "공휴일에도 평일처럼 분석을 돌려
+  직전 거래일과 동일한 데이터가 중복 기록되는" 문제 검증
+- 배경: 2026-09-24~25 추석 연휴 이틀 다 실제로 이 문제가 발생해(사용자가 확인),
+  main.py의 _should_run_now()/_previous_business_day()가 data.krx_calendar의
+  is_krx_trading_day()를 쓰도록 바뀌었다(main.py 변경이력 【2026-09-29】 참고).
+  이 테스트는 그 수정이 실제 2026년 추석 연휴에 대해 맞게 동작하는지 고정한다.
 ================================================================================
 """
 from datetime import datetime
@@ -69,3 +75,30 @@ class TestShouldRunNow:
 
     def test_no_prior_completion_runs_immediately(self):
         assert _should_run_now({}, datetime(2026, 9, 21, 10, 0)) is True
+
+
+class TestHolidayAwareness:
+    """2026-09-29 추가: 2026 추석 연휴(9/24~25, 실제 KRX 휴장) 관련 회귀 테스트."""
+
+    def test_previous_business_day_skips_chuseok_holiday(self):
+        # 2026-09-28(월)의 "그 전 실제 거래일"은 9/24~27(추석 연휴+주말)을
+        # 모두 건너뛴 9/23(수, 추석 연휴 시작 전 마지막 정상 거래일)이어야 한다.
+        assert _previous_business_day(datetime(2026, 9, 28).date()) == datetime(2026, 9, 23).date()
+
+    def test_should_run_now_skips_on_holiday_regardless_of_time(self):
+        # 9/24(추석 연휴, 평일)는 목표 시각(22:00)을 넘겨도 실행하면 안 된다.
+        state = {"last_completed_date": "2026-09-23"}
+        holiday_evening = datetime(2026, 9, 24, 22, 30)
+        assert _should_run_now(state, holiday_evening) is False
+
+    def test_monday_after_chuseok_waits_for_target_not_catchup(self):
+        # 연휴 마지막 정상 거래일(9/23) 완료 기록을 들고 연휴 다음 첫 거래일인
+        # 월요일(9/28) 새벽을 맞아도, "며칠 밀렸다"고 오판해 즉시 캐치업하면
+        # 안 된다 - 9/24~27은 애초에 거래일이 아니었으므로 정상적으로 그날
+        # 22:00 목표 시각까지 대기해야 한다.
+        state = {"last_completed_date": "2026-09-23"}
+        monday_after_chuseok_midnight = datetime(2026, 9, 28, 0, 1)
+        assert _should_run_now(state, monday_after_chuseok_midnight) is False
+
+        monday_after_chuseok_evening = datetime(2026, 9, 28, 22, 5)
+        assert _should_run_now(state, monday_after_chuseok_evening) is True
