@@ -1,7 +1,7 @@
 """pyramiding.py 테스트 (Phase 6-1) - should_add()/check_stop()의 각 차단 조건."""
 import pytest
 from market_intelligence.trade_execution.config import TradingConfig
-from market_intelligence.trade_execution.pyramiding import should_add, check_stop
+from market_intelligence.trade_execution.pyramiding import should_add, check_stop, stop_after_add
 
 CONFIG = TradingConfig(total_capital=7_000_000.0)
 
@@ -98,3 +98,18 @@ class TestCheckStop:
         action, reason = check_stop(_position(stop_price=None), current_price=9_500.0)
         assert action == "HOLD"
         assert reason == "MISSING_STOP_OR_PRICE"
+
+
+class TestStopAfterAdd:
+    """【2026-10-14】추가매수 후 손절가 = max(기존, 마지막 매수가 - ATR20 x 2)."""
+
+    def test_raises_stop_to_last_entry_minus_2n(self):
+        assert stop_after_add(11_113.0, 12_930.0, 473.5) == 12_930.0 - 947.0
+
+    def test_never_lowers_existing_stop(self):
+        assert stop_after_add(12_500.0, 12_930.0, 473.5) == 12_500.0
+
+    @pytest.mark.parametrize("args", [(None, 12_930.0, 473.5), (11_113.0, None, 473.5), (11_113.0, 12_930.0, None), (11_113.0, 12_930.0, 0)])
+    def test_missing_inputs_return_none(self, args):
+        assert stop_after_add(*args) is None
+

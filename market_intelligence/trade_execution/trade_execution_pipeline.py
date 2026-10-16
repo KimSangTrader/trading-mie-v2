@@ -109,17 +109,28 @@ pyramiding/exit_engine) ↔ KIS 주문 API ↔ DB(trade_positions/trading_histor
   그대로 남기도록 추가했다. 반환값/로직은 전혀 바꾸지 않았다(로그만 추가) -
   tests/test_trade_execution_pipeline.py 17개 시나리오(fake-ORM 검증) 재확인
   결과 전부 그대로 통과.
+
+【2026-10-14】수익구간 보호 보강 1단계 + 장중 손절 감시 연동
+- run_exit_pipeline(): 손절(INITIAL/TRAILING) 판정을 intraday_stop_monitor.py가
+  전담하도록 analyze_exit(check_stop=not ExitConfig.stop_handled_by_intraday_monitor)로
+  호출한다(09:05 스냅샷 한 번으로 손절되던 문제 - 083310 2026-10-13). 나머지 규칙은 그대로.
+- run_exit_pipeline()/run_pyramiding_pipeline(): OPEN 포지션 조회에 with_for_update()를
+  붙여 장중 감시와 같은 포지션을 동시에 매도하지 않게 했다(PostgreSQL 행 잠금,
+  SQLite 테스트에서는 무시됨).
+- run_pyramiding_pipeline(): 추가매수 직후 pyramiding.stop_after_add()로 손절가를
+  "마지막 매수가 - 2N" 이상으로 올린다(터틀 원칙).
+- SELL_ALL 기록 로직을 close_position_all()로 뽑아 장중 감시와 공유(동작 동일).
 ================================================================================
 """
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from market_intelligence.trade_execution.config import TradingConfig, ExitConfig, DEFAULT_CONFIG, DEFAULT_EXIT_CONFIG
 from market_intelligence.trade_execution.entry_filter import check_entry
 from market_intelligence.trade_execution.diversification import diversify_candidates
 from market_intelligence.trade_execution.position_sizer import calculate_position, split_entry_shares
-from market_intelligence.trade_execution.pyramiding import should_add
+from market_intelligence.trade_execution.pyramiding import should_add, stop_after_add
 from market_intelligence.trade_execution.portfolio_risk import clip_shares_to_portfolio_risk
 from market_intelligence.trade_execution.exit_engine import analyze_exit, update_stop
 
@@ -157,6 +168,25 @@ def _place_order_or_dry_run(kis_client, dry_run: bool, ticker: str, side: str, q
     return kis_client.place_order(ticker, side, quantity, order_type="market")
 
 
+def close_position_all(session, position, quantity: int, price: Optional[float], reason: str) -> None:
+    """전량 매도 주문이 접수된 포지션을 CLOSED로 바꾸고 TradingHistory에 SELL 1행을
+    남긴다. 【2026-10-14】run_exit_pipeline()과 intraday_stop_monitor.py가 같은
+    기록 방식을 쓰도록 run_exit_pipeline()의 SELL_ALL 분기에서 뽑아냈다(동작 동일).
+    commit은 호출측 책임."""
+    from db.models import TradingHistory
+
+    position.status = "CLOSED"
+    position.closed_at = datetime.now(timezone.utc)
+    position.close_price = price
+    position.close_reason = reason
+    session.add(TradingHistory(
+        ticker=position.ticker, trade_type="SELL", quantity=quantity,
+        price=price,
+        total_amount=int(quantity * price) if price else None,
+        signal_source=f"EXIT_{reason}", result="executed",
+    ))
+
+
 def run_exit_pipeline(
     session,
     kis_client,
@@ -183,7 +213,9 @@ def run_exit_pipeline(
     """
     from db.models import TradePosition, TradingHistory
 
-    positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").all()
+    # 【2026-10-14】with_for_update(): 장중 감시(intraday_stop_monitor)와 같은 포지션을
+    # 동시에 매도하지 않도록 행 잠금(PostgreSQL). SQLite(테스트)에서는 무시된다.
+    positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").with_for_update().all()
     result = {
         "checked": 0, "sold_all": 0, "partial_sold": 0, "stops_updated": 0,
         "skipped_no_market_data": 0, "errors": [],
@@ -197,23 +229,17 @@ def run_exit_pipeline(
             continue
 
         pos_dict = position_to_dict(position)
-        action, reason, fraction = analyze_exit(pos_dict, market, exit_config)
+        action, reason, fraction = analyze_exit(
+            pos_dict, market, exit_config,
+            check_stop=not exit_config.stop_handled_by_intraday_monitor,
+        )
         current_price = market.get("current_price")
 
         if action == "SELL_ALL":
             qty = position.quantity
             order_result = _place_order_or_dry_run(kis_client, dry_run, position.ticker, "sell", qty)
             if order_result.get("success"):
-                position.status = "CLOSED"
-                position.closed_at = datetime.now(timezone.utc)
-                position.close_price = current_price
-                position.close_reason = reason
-                session.add(TradingHistory(
-                    ticker=position.ticker, trade_type="SELL", quantity=qty,
-                    price=current_price,
-                    total_amount=int(qty * current_price) if current_price else None,
-                    signal_source=f"EXIT_{reason}", result="executed",
-                ))
+                close_position_all(session, position, qty, current_price, reason)
                 result["sold_all"] += 1
             else:
                 result["errors"].append({"ticker": position.ticker, "action": "SELL_ALL", "message": order_result.get("message")})
@@ -290,7 +316,7 @@ def run_pyramiding_pipeline(
     """
     from db.models import TradePosition, TradingHistory
 
-    positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").all()
+    positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").with_for_update().all()
     result = {"checked": 0, "added": 0, "skipped_no_candidate_data": 0, "errors": []}
 
     for position in positions:
@@ -323,6 +349,14 @@ def run_pyramiding_pipeline(
             position.entry_count = next_seq
             position.last_entry_price = current_price
 
+            # 【2026-10-14】터틀 원칙: 추가매수 직후 전체 손절가를 마지막 매수가 - 2N 이상으로
+            new_stop = stop_after_add(
+                float(position.stop_price) if position.stop_price is not None else None,
+                current_price, candidate.get("atr20"), config,
+            )
+            if new_stop is not None:
+                position.stop_price = new_stop
+
             session.add(TradingHistory(
                 ticker=position.ticker, trade_type="BUY", quantity=add_qty,
                 price=current_price,
@@ -345,6 +379,8 @@ def run_entry_pipeline(
     available_cash: Optional[float] = None,
     config: TradingConfig = DEFAULT_CONFIG,
     dry_run: bool = False,
+    excluded_tickers: Optional[set] = None,
+    skip_log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """계층형 랭킹 후보 리스트에서 신규 진입 대상을 골라 매수하고 TradePosition을
     새로 만든다.
@@ -368,10 +404,18 @@ def run_entry_pipeline(
     반영되게 한다(그렇지 않으면 여러 종목을 한 번에 승인할 때 위험 총합이
     한도를 넘을 수 있음).
 
+    【2026-10-14】장중 매매 루프(intraday_stop_monitor)가 1분마다 호출하면서 두 인자 추가:
+        excluded_tickers: 후보에서 뺄 종목(당일 청산 종목 재진입 금지 등).
+        skip_log: 종목별 진입 보류 사유 출력 함수(기본 print). 장중 루프는 사유가
+            바뀔 때만 찍는 함수를 넘겨 1분마다 같은 줄이 반복되지 않게 한다.
+
     Returns:
         {"checked", "entered", "skipped_no_slot", "errors": [{"ticker","message"}]}
     """
     from db.models import TradePosition, TradingHistory
+
+    if excluded_tickers:
+        ranked_candidates = [c for c in ranked_candidates if c.get("ticker") not in excluded_tickers]
 
     open_positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").all()
     open_tickers = {p.ticker for p in open_positions}
@@ -427,14 +471,14 @@ def run_entry_pipeline(
             # deploy/*.service 전체에 Environment="PYTHONUNBUFFERED=1"을 추가하는
             # 것으로 처리(각 서비스 파일 변경이력 참고) - 이 print() 문들은 여전히
             # 유효하고 정상 동작하므로 되돌리지 않는다.
-            print(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
+            skip_log(f"⏭️  {ticker}: 진입 보류/제외 - {action} ({reason})")
             continue
 
         entry_price = candidate.get("current_price")
         atr20 = candidate.get("atr20")
         sized = calculate_position(entry_price, atr20, available_cash, config)
         if sized is None:
-            print(f"⏭️  {ticker}: 포지션 사이징 실패(calculate_position=None) - "
+            skip_log(f"⏭️  {ticker}: 포지션 사이징 실패(calculate_position=None) - "
                   f"entry_price={entry_price}, atr20={atr20}, available_cash={available_cash}")
             continue
 
@@ -442,18 +486,18 @@ def run_entry_pipeline(
         if action == "REDUCE":
             target_shares = int(target_shares * config.reduce_position_ratio)
         if target_shares <= 0:
-            print(f"⏭️  {ticker}: target_shares<=0 ({target_shares}) - 사이징 결과 0주")
+            skip_log(f"⏭️  {ticker}: target_shares<=0 ({target_shares}) - 사이징 결과 0주")
             continue
 
         first_tranche = split_entry_shares(target_shares, 1, config)
         if first_tranche <= 0:
-            print(f"⏭️  {ticker}: 1차 진입 수량<=0 ({first_tranche}, target_shares={target_shares})")
+            skip_log(f"⏭️  {ticker}: 1차 진입 수량<=0 ({first_tranche}, target_shares={target_shares})")
             continue
 
         risk_per_share = sized["risk_per_share"]
         buy_qty = clip_shares_to_portfolio_risk(first_tranche, risk_per_share, risk_positions, config)
         if buy_qty <= 0:
-            print(f"⏭️  {ticker}: 포트폴리오 리스크 클리핑 후 매수 수량<=0 "
+            skip_log(f"⏭️  {ticker}: 포트폴리오 리스크 클리핑 후 매수 수량<=0 "
                   f"(1차수량={first_tranche}, risk_per_share={risk_per_share})")
             continue
 
@@ -625,6 +669,15 @@ if __name__ == "__main__":
     # 항상 "development"(모의투자)로 시작한다 - 실전 전환은 .env에
     # MIE_TRADE_ENVIRONMENT=production을 명시적으로 추가해야만 일어난다.
     # 자세한 경위는 파일 상단 변경이력 【2026-08-27】참고.
+    # 【2026-10-14】장중 매매 루프(intraday_stop_monitor, 1분 주기)가 켜져 있으면 이 하루 1회
+    # 사이클은 실행하지 않는다 - 둘이 같은 시각에 신규진입하면 같은 종목을 이중으로 살 수 있다.
+    # (09:05 타이머가 남아 있어도 안전하도록 코드에서 막는다.)
+    from market_intelligence.trade_execution.config import DEFAULT_INTRADAY_MONITOR_CONFIG
+    if DEFAULT_INTRADAY_MONITOR_CONFIG.intraday_trading_enabled:
+        print("ℹ️  장중 매매 루프(intraday_stop_monitor)가 1분 주기로 매매를 전담 중 - 하루 1회 사이클은 건너뜁니다 "
+              "(IntradayMonitorConfig.intraday_trading_enabled)")
+        raise SystemExit(0)
+
     trade_environment = os.getenv("MIE_TRADE_ENVIRONMENT", "development").lower()
     print(f"⚠️  매매 실행 환경: {trade_environment} "
           f"({'실전투자 - 진짜 주문' if trade_environment == 'production' else '모의투자'})")

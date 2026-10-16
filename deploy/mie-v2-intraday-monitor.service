@@ -1,0 +1,18 @@
+# 【2026-10-14】장중 손절 감시 (intraday_stop_monitor.py)
+# 평일 08:55 KST에 타이머가 띄우고, 15:20 KST에 스스로 종료(exit 0)한다. KRX 휴장일이면
+# 바로 종료한다. 정상 종료는 재시작하지 않고, 크래시(비정상 종료)만 재기동한다.
+[Unit]
+Description=MIE V2.0 - 장중 손절 감시 (평일 09:00~15:20 KST)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+ExecStart=/opt/mie-v2/venv/bin/python -m market_intelligence.trade_execution.intraday_stop_monitor
+StandardOutput=append:/var/log/mie-v2/intraday_monitor.log
+StandardError=append:/var/log/mie-v2/intraday_monitor.log
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Restart=on-failure
+RestartSec=30

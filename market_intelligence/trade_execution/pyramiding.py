@@ -31,7 +31,7 @@
 ================================================================================
 """
 
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 from market_intelligence.trade_execution.config import TradingConfig, DEFAULT_CONFIG
 
@@ -103,3 +103,16 @@ def check_stop(position: Dict[str, Any], current_price: float) -> Tuple[str, str
         return "STOP_LOSS", "STOP_PRICE_HIT"
 
     return "HOLD", "ABOVE_STOP"
+
+
+def stop_after_add(current_stop: Optional[float], add_price: Optional[float], atr20: Optional[float],
+                   config: TradingConfig = DEFAULT_CONFIG) -> Optional[float]:
+    """【2026-10-14 신규】추가매수(피라미딩) 직후 전체 보유분의 손절가를 터틀 원칙대로
+    "마지막 매수가 - ATR20 x stop_atr_multiple(2N)" 이상으로 끌어올린다(위로만).
+
+    기존에는 추가매수 후에도 손절가가 첫 진입 기준에 그대로 남아, 추가로 산 물량은
+    처음부터 매수가보다 한참 아래 손절가를 달고 있었다(083310: 2차 매수 12,930원인데
+    손절가 12,060원). 데이터가 없으면 None - 호출측은 기존 손절가를 유지한다."""
+    if current_stop is None or add_price is None or atr20 is None or atr20 <= 0:
+        return None
+    return max(current_stop, add_price - atr20 * config.stop_atr_multiple)

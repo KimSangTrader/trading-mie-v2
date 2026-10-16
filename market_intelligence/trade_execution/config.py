@@ -68,6 +68,29 @@
   docstring에 상세 설명). 초기 손절인지 트레일링 손절인지는
   position["initial_stop_price"](최초 계산된 손절가, 절대 바뀌지 않음)와
   현재 stop_price를 비교해서 구분한다.
+
+【2026-10-14】수익구간 보호 보강 1단계 - ExitConfig 2개 필드 + IntradayMonitorConfig 추가
+- 배경: 실거래(모의) 복기 결과 083310(엘오티베큠)이 장중 +2.05R(14,000원)까지
+  갔다가 -2.6% 손실로 청산됐고, 043590(웰킵스하이텍)은 +3.55R(2,725원)을
+  찍고도 손절가가 +0.49R(2,091원)에 머물렀다. 사용자(터틀 트레이딩 관점)와
+  논의해 "파라미터 튜닝 전에 구조 결함부터 고친다(1단계)"와 "손절 판정은
+  장중 감시(C-2)로 옮긴다"를 확정했다.
+- breakeven_cost_buffer_pct: 본전 보호 기준을 첫 진입가가 아니라 평균단가
+  (피라미딩 반영)+거래비용으로 바꾸면서 추가(exit_engine.update_stop() 참고).
+- stop_handled_by_intraday_monitor: 손절 판정을 intraday_stop_monitor.py로
+  넘기고 하루 1회 사이클에서는 건너뛰기 위한 스위치.
+- IntradayMonitorConfig: 장중 감시의 휩쏘 방지 장치(시초 10분 얕은 이탈 무시,
+  연속 3회 확인, 깊은 이탈 즉시 매도) 값. 전부 이 세션이 정한 초기값이며
+  백테스트로 검증된 값이 아니다 - 한동안 운영 후 사용자가 재검토하기로 함.
+
+【2026-10-14】IntradayMonitorConfig에 장중 매매 필드 추가
+- 배경: 사용자가 "감시는 1분마다 하는데 매수/매도가 하루 1회(09:05)인 건 주기가
+  너무 길다 - 추가매수/신규매수도 감시 주기에 맞춰야 한다"고 결정. 장중 루프가
+  손절뿐 아니라 하루 1회 사이클의 청산/피라미딩/신규진입까지 1분마다 수행한다.
+- 계층형 랭킹/점수/ATR20/10일 최저가는 여전히 전일 장마감 분석 기준(하루 1회 갱신)
+  이고, 장중에 바뀌는 건 현재가/당일 고가/등락률뿐이다.
+- reentry_block_hours: 1분 주기에서는 손절된 종목이 다음 틱에 다시 진입 조건을
+  만족해 같은 날 사고팔기를 반복할 수 있어 추가(16시간 = 사실상 당일 재진입 금지).
 ================================================================================
 """
 
@@ -169,5 +192,41 @@ class ExitConfig:
     minimum_sector_score: float = 45.0            # Sector 점수가 이 미만이고 Theme도 미달이면(둘 다) 전량 청산
     minimum_theme_score: float = 45.0             # Theme 점수 기준(위와 동시 충족 조건)
 
+    # ---------- 【2026-10-14】수익구간 보호 보강 (1단계) ----------
+    # 본전 보호 손절가 = 평균단가(피라미딩 반영) x (1 + 이 비율). 매수/매도 수수료 +
+    # 증권거래세(약 0.2~0.25%)를 덮어서 "본전 손절"이 실제로 손실이 되지 않게 한다.
+    breakeven_cost_buffer_pct: float = 0.003
+
+    # 손절가(INITIAL_STOP/TRAILING_STOP) 판정을 장중 감시(intraday_stop_monitor)가
+    # 전담하면 True - 하루 1회 사이클(09:05 KST)은 손절 판정을 건너뛰고 나머지
+    # 규칙(긴급청산/논리붕괴/부분익절/터틀청산)만 본다. 장 시작 5분 시점의 시세
+    # 스냅샷 한 번으로 손절되던 문제(083310, 2026-10-13) 때문에 도입.
+    stop_handled_by_intraday_monitor: bool = True
+
 
 DEFAULT_EXIT_CONFIG = ExitConfig()
+
+
+@dataclass(frozen=True)
+class IntradayMonitorConfig:
+    """장중 손절 감시(intraday_stop_monitor.py) 설정값 (2026-10-14 신규).
+
+    휩쏘(장중 일시적 이탈 후 회복)에 털리지 않도록 "얕은 이탈은 확인 후 매도,
+    깊은 이탈은 즉시 매도" 2단 구조로 둔다. 모든 시각은 KST 기준."""
+
+    poll_interval_sec: int = 60                    # 시세 확인 간격(초)
+    market_open: str = "09:00"                     # 감시 시작
+    opening_quiet_until: str = "09:10"             # 이 시각 전엔 얕은 이탈 무시(시초가 변동성) - 깊은 이탈/긴급청산만 즉시 처리
+    market_close: str = "15:20"                    # 감시 종료(종가 단일가 시작 전)
+    confirm_polls: int = 3                         # 얕은 이탈이 연속 이 횟수만큼 확인되면 매도(기본 60초 x 3 = 약 3분)
+    deep_breach_atr: float = 0.5                   # 현재가 <= 손절가 - ATR20 x 이 배수면 확인 없이 즉시 매도
+    heartbeat_minutes: int = 30                    # 이 간격마다 보유 현황 요약 로그
+
+    # ---------- 【2026-10-14】장중 매매(신규진입/피라미딩/부분익절/기타 청산)도 1분 주기로 ----------
+    intraday_trading_enabled: bool = True          # True면 하루 1회 사이클(09:05 타이머)은 실행되지 않고 장중 루프가 전담
+    trade_start: str = "09:05"                     # 장중 매매(손절 외) 시작 - 기존 하루 1회 사이클 시각과 동일
+    trade_end: str = "15:15"                       # 장중 매매 종료(종가 단일가 전 여유)
+    reentry_block_hours: int = 16                  # 이 시간 안에 청산된 종목은 신규진입 후보에서 제외(당일 재진입 금지)
+
+
+DEFAULT_INTRADAY_MONITOR_CONFIG = IntradayMonitorConfig()

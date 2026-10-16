@@ -147,6 +147,13 @@ KIS API 클라이언트 (환경별 자동 선택)
   분리, 기본값 "development"=모의투자)로 KISClient를 만든다 - 자세한 내용은
   trade_execution_pipeline.py 변경이력 참고. main.py 등 기존 호출부는
   `KISClient()`를 인자 없이 그대로 쓰므로 동작 변화 없음(하위 호환).
+
+【2026-10-14】get_current_quote() 추가 - 장중 손절 감시용
+- 배경: 손절 판정을 하루 1회(09:05 KST) 스냅샷에서 장중 감시
+  (market_intelligence/trade_execution/intraday_stop_monitor.py)로 옮기면서,
+  1분 간격으로 보유 종목의 현재가/당일 고가/등락률이 필요해졌다.
+- get_stock_fundamental()과 같은 inquire-price API를 쓰지만, 성공 시 출력을
+  하지 않는다(장중 수백 번 호출되므로 로그 폭주 방지) - 실패만 출력한다.
 ================================================================================
 """
 import requests
@@ -506,6 +513,65 @@ class KISClient:
             print(f"❌ 종목 기본분석 지표 조회 오류: {e}")
             import traceback
             traceback.print_exc()
+            return {}
+
+    def get_current_quote(self, stock_code: str) -> Dict:
+        """
+        개별 종목 현재가/당일 고가/등락률 조회 - 장중 손절 감시용 (2026-10-14 신규)
+
+        - API/tr_id는 get_stock_fundamental()과 동일(inquire-price, FHKST01010100).
+          intraday_stop_monitor.py가 장중 1분마다 보유 종목마다 호출하므로, 성공 시에는
+          아무것도 출력하지 않는다(로그 폭주 방지) - 실패만 출력한다.
+        - 반환: {"current_price", "high", "low", "change_pct"(전일 대비 %), "base_price"
+          (전일 종가 기준가)}. 실패 시 {} - 호출측은 그 틱을 건너뛴다(추측하지 않음).
+        """
+        try:
+            if not self.ensure_valid_token():
+                return {}
+
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+            headers = {
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.api_key,
+                "appsecret": self.api_secret,
+                "tr_id": "FHKST01010100",
+                "custtype": "P"
+            }
+            params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+
+            response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+            if response.status_code != 200:
+                print(f"   ❌ 현재가 조회 실패({stock_code}): {response.status_code}")
+                return {}
+
+            data = response.json()
+            if data.get('rt_cd', '0') != '0':
+                print(f"   ❌ 현재가 조회 API 오류({stock_code}): {data.get('msg1', '')}")
+                return {}
+
+            output = data.get('output', {})
+
+            def _to_float(value):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            current_price = _to_float(output.get('stck_prpr'))
+            if not current_price:
+                return {}
+
+            return {
+                "symbol": stock_code,
+                "current_price": current_price,
+                "high": _to_float(output.get('stck_hgpr')),
+                "low": _to_float(output.get('stck_lwpr')),
+                "change_pct": _to_float(output.get('prdy_ctrt')),
+                "base_price": _to_float(output.get('stck_sdpr')),
+            }
+
+        except Exception as e:
+            print(f"❌ 현재가 조회 오류({stock_code}): {e}")
             return {}
 
     def get_stock_daily_chart(self, stock_code: str, days: int = 60) -> Dict:
@@ -1164,7 +1230,7 @@ class KISClient:
             traceback.print_exc()
             return {"success": False, "message": str(e)}
 
-    def get_balance(self) -> Dict:
+    def get_balance(self, verbose: bool = True) -> Dict:
         """
         계좌 잔고조회(보유종목 + 예수금) - Phase 6-3 신규.
 
@@ -1220,7 +1286,8 @@ class KISClient:
                 "CTX_AREA_NK100": "",
             }
 
-            print("\n💰 계좌 잔고조회 중...")
+            if verbose:
+                print("\n💰 계좌 잔고조회 중...")
             response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
 
             if response.status_code != 200:
@@ -1268,9 +1335,18 @@ class KISClient:
             cash = {
                 "cash_balance": _f(summary.get("dnca_tot_amt")),
                 "total_evaluation_amount": _f(summary.get("tot_evlu_amt")),
+                # 【2026-10-14】장중 반복 매수용: 예수금총금액(dnca_tot_amt)은 당일 매수가
+                # 결제(D+2) 전까지 줄지 않아, 같은 날 여러 번 매수하면 이미 쓴 돈을 또 쓸 수
+                # 있다. D+1/D+2 정산 예정 예수금 중 가장 작은 값을 "지금 쓸 수 있는 현금"으로 본다.
+                "spendable_cash": min(
+                    _f(summary.get("dnca_tot_amt")),
+                    _f(summary.get("nxdy_excc_amt"), _f(summary.get("dnca_tot_amt"))),
+                    _f(summary.get("prvs_rcdl_excc_amt"), _f(summary.get("dnca_tot_amt"))),
+                ),
             }
 
-            print(f"   ✅ 보유 {len(positions)}종목, 예수금 {cash['cash_balance']:,.0f}원")
+            if verbose:
+                print(f"   ✅ 보유 {len(positions)}종목, 예수금 {cash['cash_balance']:,.0f}원")
             return {"positions": positions, "cash": cash, "raw_output1": output1, "raw_output2": output2}
 
         except Exception as e:

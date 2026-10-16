@@ -187,10 +187,33 @@ class TestCalculateTrailingStop:
 
 class TestUpdateStop:
     def test_document_day5_breakeven(self):
-        """문서 Day5: 현재가 11,000원(+1R) -> 손절가 9,000 -> 10,000원(본전)으로 상승."""
+        """문서 Day5: 현재가 11,000원(+1R) -> 손절가 9,000 -> 본전으로 상승.
+        【2026-10-14】본전 = 진입가 x (1 + 거래비용 0.3%) = 10,030원(문서 원본은 10,000원)."""
         pos = _position(stop_price=9_000.0, highest_price=10_000.0)
         result = update_stop(pos, current_high=11_000.0, atr20=500.0, current_price=11_000.0, config=CONFIG)
-        assert result["stop_price"] == 10_000.0
+        assert result["stop_price"] == pytest.approx(10_030.0)
+
+    def test_breakeven_uses_average_price_after_pyramiding(self):
+        """【2026-10-14】피라미딩으로 평균단가가 10,400원이면 본전 보호도 평균단가 기준
+        (10,400 x 1.003 = 10,431.2원) - 첫 진입가(10,000원)만 지키면 실제로는 손실."""
+        pos = _position(stop_price=9_000.0, highest_price=10_000.0, average_price=10_400.0)
+        result = update_stop(pos, current_high=11_200.0, atr20=500.0, current_price=11_200.0, config=CONFIG)
+        assert result["stop_price"] == pytest.approx(10_431.2)
+
+    def test_trailing_keyed_off_peak_not_current_price(self):
+        """【2026-10-14】장중 고가 13,500원(+3.5R)을 찍고 현재가가 11,500원(+1.5R)으로
+        밀려도, 최고가 기준으로 트레일링이 적용된다: 13,500 - 500x3 = 12,000원.
+        (원본은 현재가 기준이라 본전 10,000원에 머물렀음 - 043590 2026-10-13 사례)"""
+        pos = _position(stop_price=9_000.0, highest_price=10_000.0)
+        result = update_stop(pos, current_high=13_500.0, atr20=500.0, current_price=11_500.0, config=CONFIG)
+        assert result["stop_price"] == 12_000.0
+        assert result["highest_price"] == 13_500.0
+
+    def test_trailing_stays_active_after_pullback_below_2r(self):
+        """이미 기록된 최고가가 +2R 이상이면, 이후 가격이 2R 아래여도 트레일링 유지."""
+        pos = _position(stop_price=10_030.0, highest_price=12_400.0)
+        result = update_stop(pos, current_high=11_200.0, atr20=400.0, current_price=11_100.0, config=CONFIG)
+        assert result["stop_price"] == 12_400.0 - 400.0 * 3
 
     def test_document_section7_2r_trailing(self):
         """문서 §7: 최고가 12,000원 도달(+2R), ATR20 500 -> 트레일링 스톱 10,500원."""

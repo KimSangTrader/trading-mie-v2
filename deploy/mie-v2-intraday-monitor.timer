@@ -1,0 +1,10 @@
+[Unit]
+Description=MIE V2.0 - 장중 손절 감시 시작 (평일 08:55 KST)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:55:00 Asia/Seoul
+Persistent=true
+Unit=mie-v2-intraday-monitor.service
+
+[Install]
+WantedBy=timers.target

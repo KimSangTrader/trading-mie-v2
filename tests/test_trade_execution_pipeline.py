@@ -18,7 +18,10 @@ from market_intelligence.trade_execution.trade_execution_pipeline import (
 )
 
 CONFIG = TradingConfig(total_capital=7_000_000.0, max_positions=3, max_per_sector=2, max_per_theme=2)
-EXIT_CONFIG = ExitConfig()
+# 아래 기존 시나리오들은 "하루 1회 사이클이 손절까지 판정하던" 동작을 검증한다 -
+# 【2026-10-14】손절 판정 기본값이 장중 감시로 넘어갔으므로 그 스위치를 끈 설정으로
+# 고정해 기존 검증을 그대로 유지한다. 기본값(감시 전담) 동작은 별도 테스트 참고.
+EXIT_CONFIG = ExitConfig(stop_handled_by_intraday_monitor=False)
 
 
 class MockKISClient:
@@ -178,7 +181,38 @@ class TestRunExitPipeline:
         assert refreshed.status == "OPEN"  # 주문 실패 - DB에 청산 반영 안 됨
 
 
+    def test_default_config_leaves_stop_to_intraday_monitor(self, session):
+        """기본 ExitConfig(stop_handled_by_intraday_monitor=True)에서는 하루 1회
+        사이클이 손절가 하회만으로는 매도하지 않는다 - 장중 감시가 전담."""
+        pos = _open_position()
+        session.add(pos)
+        session.commit()
+
+        kis = MockKISClient()
+        market_data = {"005930": _market(current_price=8_900.0)}  # 손절가(9,000) 하회
+
+        result = run_exit_pipeline(session, kis, market_data, CONFIG, ExitConfig())
+
+        assert result["sold_all"] == 0
+        assert kis.orders == []
+        assert session.query(TradePosition).filter_by(ticker="005930").one().status == "OPEN"
+
+
 class TestRunPyramidingPipeline:
+    def test_add_raises_stop_to_last_entry_minus_2n(self, session):
+        """터틀 원칙: 추가매수 직후 손절가 = max(기존 9,000, 10,600 - 500x2) = 9,600."""
+        pos = _open_position()
+        session.add(pos)
+        session.commit()
+
+        kis = MockKISClient()
+        market_data = {"005930": _market(current_price=10_600.0, current_rank=3)}
+
+        run_pyramiding_pipeline(session, kis, market_data, CONFIG)
+
+        refreshed = session.query(TradePosition).filter_by(ticker="005930").one()
+        assert float(refreshed.stop_price) == 9_600.0
+
     def test_add_executes_buy_and_updates_average_price(self, session):
         pos = _open_position()
         session.add(pos)

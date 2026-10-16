@@ -90,6 +90,7 @@ def analyze_exit(
     position: Dict[str, Any],
     market: Dict[str, Any],
     config: ExitConfig = DEFAULT_EXIT_CONFIG,
+    check_stop: bool = True,
 ) -> Tuple[str, str, float]:
     """문서 §11 PositionExitAnalyzer.analyze()를 그대로 이식.
 
@@ -109,6 +110,10 @@ def analyze_exit(
       4순위 +2R 부분 익절(TAKE_PROFIT_2R)
       5순위 터틀 10일 최저가 이탈(TURTLE_10DAY_EXIT)
       6순위 정상 보유(HOLD/NONE)
+
+    check_stop=False면 2순위(손절) 판정을 건너뛴다 - 【2026-10-14】손절 판정을
+    장중 감시(intraday_stop_monitor.py)가 전담할 때 하루 1회 사이클이 장 초반
+    시세 스냅샷 한 번으로 손절하지 않게 하기 위함(ExitConfig.stop_handled_by_intraday_monitor).
     """
     current_price = market.get("current_price")
     if current_price is None:
@@ -121,7 +126,7 @@ def analyze_exit(
 
     # 2순위: 손절 (초기 손절 또는 트레일링 스톱 - stop_price 하나로 통합)
     stop_price = position.get("stop_price")
-    if stop_price is not None and current_price <= stop_price:
+    if check_stop and stop_price is not None and current_price <= stop_price:
         initial_stop_price = position.get("initial_stop_price")
         if initial_stop_price is not None and stop_price == initial_stop_price:
             return "SELL_ALL", "INITIAL_STOP", 1.0
@@ -203,6 +208,19 @@ def update_stop(
     번째 max()가 항상 첫 번째를 덮어쓰므로, get_trailing_atr_multiple()로
     구간별 배수 하나만 골라 한 번에 적용해도 수학적으로 동일한 결과다.
 
+    【2026-10-14 변경 - 수익구간 보호 1단계】문서 원본과 두 가지가 다르다:
+    (1) R배수를 "현재가"가 아니라 "보유 중 최고가(highest_price, 최대 유리 구간)"
+        기준으로 계산한다. 원본은 profit_r을 current_price로 계산해서, 장중
+        +3.5R까지 갔어도 판정 시점 가격이 2R 아래면 트레일링이 아예 적용되지
+        않았다(043590, 10/13 고가 2,725원 = +3.55R인데 10/14 손절가 +0.49R 유지).
+        터틀 원칙대로 한 번 도달한 수익 구간의 보호 수준은 가격이 눌려도 유지한다.
+    (2) 본전 보호 기준을 첫 진입가(entry_price)가 아니라 max(진입가, 평균단가) x
+        (1 + breakeven_cost_buffer_pct)로 올렸다. 원본은 피라미딩으로 평균단가가
+        올라가도 첫 진입가만 보호해서 "본전 손절"이 실제로는 손실이었다
+        (083310: 본전 손절가 12,060원 vs 평균단가 12,350원 -> -2.6% 청산).
+    R배수의 분모(initial_risk_per_share)와 기준가(entry_price)는 그대로 첫 진입
+    기준이다 - 부분익절(+2R) 판정과 같은 잣대를 유지하기 위함.
+
     이 함수는 position을 변형하지 않는 순수 함수다 - 새 stop_price/highest_price를
     담은 dict를 반환하고, 호출측(파이프라인)이 DB에 반영해야 한다.
 
@@ -212,6 +230,7 @@ def update_stop(
     initial_risk_per_share = position.get("initial_risk_per_share")
     current_stop = position.get("stop_price")
     previous_highest = position.get("highest_price")
+    average_price = position.get("average_price")
 
     if (
         entry_price is None
@@ -227,16 +246,18 @@ def update_stop(
 
     highest_price = max(previous_highest, current_high) if previous_highest is not None else current_high
 
-    profit_r = (current_price - entry_price) / initial_risk_per_share
+    # 최대 유리 구간(MFE) 기준 R배수 - 위 docstring (1) 참고
+    peak_r = (highest_price - entry_price) / initial_risk_per_share
 
     new_stop = current_stop
 
-    # +1R 이상 -> 최소 본전(진입가) 보호
-    if profit_r >= config.breakeven_trigger_r:
-        new_stop = max(new_stop, entry_price)
+    # +1R 이상 -> 평균단가 + 거래비용까지 보호 (docstring (2) 참고)
+    if peak_r >= config.breakeven_trigger_r:
+        cost_basis = max(entry_price, average_price) if average_price is not None else entry_price
+        new_stop = max(new_stop, cost_basis * (1 + config.breakeven_cost_buffer_pct))
 
     # +2R(트레일링 시작) / +4R(더 타이트한 트레일링) -> ATR 트레일링, 위로만
-    atr_multiple = get_trailing_atr_multiple(profit_r, config)
+    atr_multiple = get_trailing_atr_multiple(peak_r, config)
     if atr_multiple is not None:
         new_stop = calculate_trailing_stop(new_stop, highest_price, atr20, atr_multiple)
 
