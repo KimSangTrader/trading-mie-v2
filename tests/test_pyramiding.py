@@ -80,6 +80,14 @@ class TestShouldAdd:
         assert action == "HOLD"
         assert reason == "THEME_WEAKENED"
 
+    def test_unmapped_theme_blocked_by_default(self):
+        """2026-10-20: 기본값은 기존 동작 - 테마 None이면 THEME_WEAKENED."""
+        assert should_add(_position(), _candidate(theme_score=None), CONFIG) == ("HOLD", "THEME_WEAKENED")
+
+    def test_unmapped_theme_allows_add_when_enabled(self):
+        config = TradingConfig(total_capital=7_000_000.0, skip_theme_check_if_unmapped=True)
+        assert should_add(_position(), _candidate(theme_score=None), config) == ("ADD", "PYRAMID_APPROVED")
+
 
 class TestCheckStop:
     def test_stop_hit(self):

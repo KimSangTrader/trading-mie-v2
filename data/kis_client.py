@@ -154,6 +154,19 @@ KIS API 클라이언트 (환경별 자동 선택)
   1분 간격으로 보유 종목의 현재가/당일 고가/등락률이 필요해졌다.
 - get_stock_fundamental()과 같은 inquire-price API를 쓰지만, 성공 시 출력을
   하지 않는다(장중 수백 번 호출되므로 로그 폭주 방지) - 실패만 출력한다.
+
+【2026-10-20】조회(GET) 실패 시 1회 재시도 + 응답 본문 로깅 (_get_with_retry)
+- 배경: 장중 루프 로그에 "❌ 조회 실패! 500"이 10/15부터 매일 8~16건씩 찍혔는데,
+  상태코드만 출력하고 응답 본문을 버려서 어떤 사유(KIS msg_cd/msg1 - 예:
+  EGW00201 초당 거래건수 초과)인지 알 수 없었고, 재시도도 없어 그 틱이 통째로
+  날아갔다(잔고조회 실패 -> 그 1분 신규진입 건너뜀, 현재가 실패 -> 그 1분 손절 점검 누락).
+- 조치: 조회용 메서드(get_stock_fundamental/get_current_quote/get_stock_daily_chart/
+  get_investor_trend/get_daily_price/get_balance/get_pending_orders)의 requests.get을
+  _get_with_retry()로 교체. 비200 또는 연결 오류면 1초 뒤 1회만 재시도하고, 그래도
+  실패하면 응답 본문 요약(msg_cd/msg1, JSON이 아니면 앞 200자)을 출력한 뒤 기존과
+  똑같이 실패 응답을 돌려준다(호출부 동작 변화 없음).
+- 【중요, 안전】place_order()(POST 주문)에는 절대 적용하지 않는다 - 서버가 주문을
+  받고도 500/타임아웃을 낼 수 있어 재시도하면 중복 주문이 될 수 있다.
 ================================================================================
 """
 import requests
@@ -246,6 +259,43 @@ class KISClient:
         print(f"   서버: {self.base_url}")
         print(f"   Account: {self.account[:10]}***")
     
+    # 【2026-10-20】조회 실패 시 재시도 대기 시간(초) - 변경이력 【2026-10-20】참고
+    QUERY_RETRY_DELAY_SECONDS = 1.0
+
+    @staticmethod
+    def _summarize_error_body(response) -> str:
+        """실패 응답 본문 요약 - KIS JSON이면 msg_cd/msg1, 아니면 앞 200자."""
+        try:
+            data = response.json()
+            return f"msg_cd={data.get('msg_cd', '')}, msg1={data.get('msg1', '')}"
+        except ValueError:
+            return (response.text or "")[:200].replace("\n", " ")
+
+    def _get_with_retry(self, url: str, headers: Dict, params: Dict, label: str):
+        """조회용 GET - 비200/연결 오류면 1회 재시도, 최종 실패 시 응답 본문을 출력한다.
+
+        최종 결과(Response)를 그대로 돌려주므로 호출부의 status_code 검사는 그대로 둔다.
+        두 번 다 연결 오류면 마지막 예외를 그대로 올린다(호출부 except가 처리).
+        【주의】주문(place_order 등 POST)에는 쓰지 말 것 - 중복 주문 위험.
+        """
+        for attempt in (1, 2):
+            try:
+                response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+            except requests.exceptions.RequestException as e:
+                if attempt == 2:
+                    raise
+                print(f"   ⚠️  {label} 연결 오류({e}) - {self.QUERY_RETRY_DELAY_SECONDS:g}초 후 1회 재시도")
+                time.sleep(self.QUERY_RETRY_DELAY_SECONDS)
+                continue
+            if response.status_code == 200:
+                return response
+            body = self._summarize_error_body(response)
+            if attempt == 2:
+                print(f"   ❌ {label} 재시도 후에도 실패: HTTP {response.status_code} ({body})")
+                return response
+            print(f"   ⚠️  {label} HTTP {response.status_code} ({body}) - {self.QUERY_RETRY_DELAY_SECONDS:g}초 후 1회 재시도")
+            time.sleep(self.QUERY_RETRY_DELAY_SECONDS)
+
     def get_access_token(self) -> bool:
         """KIS API 접근 토큰 발급"""
         try:
@@ -463,13 +513,7 @@ class KISClient:
                 "FID_INPUT_ISCD": stock_code
             }
 
-            response = requests.get(
-                url,
-                headers=headers,
-                params=params,
-                verify=False,
-                timeout=10
-            )
+            response = self._get_with_retry(url, headers, params, f"종목 기본정보({stock_code})")
 
             print(f"   상태 코드: {response.status_code}")
 
@@ -539,7 +583,7 @@ class KISClient:
             }
             params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
 
-            response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+            response = self._get_with_retry(url, headers, params, f"현재가({stock_code})")
             if response.status_code != 200:
                 print(f"   ❌ 현재가 조회 실패({stock_code}): {response.status_code}")
                 return {}
@@ -632,13 +676,7 @@ class KISClient:
                 "FID_ORG_ADJ_PRC": "0"           # 수정주가 반영
             }
 
-            response = requests.get(
-                url,
-                headers=headers,
-                params=params,
-                verify=False,
-                timeout=10
-            )
+            response = self._get_with_retry(url, headers, params, f"일봉({stock_code})")
 
             if response.status_code != 200:
                 print(f"   ❌ 조회 실패! {stock_code} - {response.status_code}")
@@ -730,13 +768,7 @@ class KISClient:
                 "FID_INPUT_ISCD": stock_code,
             }
 
-            response = requests.get(
-                url,
-                headers=headers,
-                params=params,
-                verify=False,
-                timeout=10
-            )
+            response = self._get_with_retry(url, headers, params, f"투자자 매매동향({stock_code})")
 
             if response.status_code != 200:
                 print(f"   ❌ 조회 실패! {stock_code} - {response.status_code}")
@@ -873,13 +905,7 @@ class KISClient:
                 }
                 
                 # API 호출
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params=params,
-                    verify=False,
-                    timeout=10
-                )
+                response = self._get_with_retry(url, headers, params, f"일별시세({stock_code})")
                 
                 print(f"   상태 코드: {response.status_code}")
                 
@@ -1288,7 +1314,7 @@ class KISClient:
 
             if verbose:
                 print("\n💰 계좌 잔고조회 중...")
-            response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+            response = self._get_with_retry(url, headers, params, "잔고조회")
 
             if response.status_code != 200:
                 print(f"   ❌ 조회 실패! {response.status_code}")
@@ -1398,7 +1424,7 @@ class KISClient:
             }
 
             print("\n📋 미체결(정정취소가능) 주문 조회 중...")
-            response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+            response = self._get_with_retry(url, headers, params, "미체결 조회")
 
             if response.status_code != 200:
                 print(f"   ❌ 조회 실패! {response.status_code}")

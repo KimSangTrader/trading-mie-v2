@@ -133,6 +133,11 @@ class TradingConfig:
     min_final_score: float = 75.0                  # 계층형 final_score 최소 기준(진입)
     min_sector_score: float = 65.0                  # Sector 점수 최소 기준(진입/추가매수 공통)
     min_theme_score: float = 60.0                   # Theme 점수 최소 기준(진입/추가매수 공통)
+    # 【2026-10-20】테마 매핑이 없는 종목(전체의 ~49%, primary_theme/theme_score가 둘 다 None)을
+    # True면 Theme 조건 생략(Sector만 봄), False(기본, 기존 동작)면 WEAK_THEME/THEME_WEAKENED로 막는다.
+    # 백테스트(scripts/backtest_entry_rules.py, 9/9~10/19)에서 True가 PF 0.56->0.24로 나빠
+    # 사용자가 보류 - 데이터가 더 쌓이면 재백테스트 후 결정.
+    skip_theme_check_if_unmapped: bool = False
     max_rank_for_add: int = 30                      # 추가매수를 허용하는 현재 랭킹 하한(이보다 나쁘면 추가매수 금지)
 
     # ---------- 후보 풀 ----------

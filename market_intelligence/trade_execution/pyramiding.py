@@ -82,7 +82,10 @@ def should_add(
         return "HOLD", "SECTOR_WEAKENED"
 
     theme_score = candidate.get("theme_score")
-    if theme_score is None or theme_score < config.min_theme_score:
+    if theme_score is None:
+        if not config.skip_theme_check_if_unmapped:  # 테마 미매핑 - entry_filter와 같은 규칙(2026-10-20)
+            return "HOLD", "THEME_WEAKENED"
+    elif theme_score < config.min_theme_score:
         return "HOLD", "THEME_WEAKENED"
 
     return "ADD", "PYRAMID_APPROVED"

@@ -54,6 +54,18 @@ class TestCheckEntry:
         assert action == "WAIT"
         assert reason == "WEAK_THEME"
 
+    def test_unmapped_theme_blocked_by_default(self):
+        """2026-10-20: 기본값(skip_theme_check_if_unmapped=False)은 기존 동작 - 테마 None이면 WEAK_THEME."""
+        assert check_entry(_candidate(theme_score=None), CONFIG) == ("WAIT", "WEAK_THEME")
+
+    def test_unmapped_theme_skips_theme_check_when_enabled(self):
+        config = TradingConfig(total_capital=7_000_000.0, skip_theme_check_if_unmapped=True)
+        assert check_entry(_candidate(theme_score=None), config) == ("BUY", "ENTRY_APPROVED")
+
+    def test_unmapped_theme_still_needs_sector_when_enabled(self):
+        config = TradingConfig(total_capital=7_000_000.0, skip_theme_check_if_unmapped=True)
+        assert check_entry(_candidate(theme_score=None, sector_score=60.0), config) == ("WAIT", "WEAK_SECTOR")
+
     def test_invalid_atr_waits(self):
         action, reason = check_entry(_candidate(atr20=0), CONFIG)
         assert action == "WAIT"

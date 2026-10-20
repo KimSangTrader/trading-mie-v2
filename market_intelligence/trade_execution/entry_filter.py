@@ -18,6 +18,15 @@ check_entry()가 돌려주는 gap 판정별 의미:
   - "WAIT" / "WAIT_CONFIRMATION": 오늘은 진입하지 않고 다음 기회(또는
     시간 경과 후 재평가)로 미룸
   - "NO_ENTRY": 이 종목은 오늘 후보에서 완전히 제외
+
+【2026-10-20】테마 미매핑 종목 Theme 조건 생략 옵션 추가 (기본 꺼짐)
+- 전체 종목의 ~49%가 테마 매핑이 없어 theme_score=None인데, 기존엔 None을
+  무조건 WEAK_THEME으로 막아서 점수와 무관하게 영구 진입 불가였다(예: 10/19
+  002320 Transportation 80.6/final 83.7 2위가 테마 None으로 탈락).
+- TradingConfig.skip_theme_check_if_unmapped=True면 None일 때 Theme 조건을
+  건너뛰고 Sector 조건만 본다. 테마 점수가 있는데 미달이면 기존대로 WEAK_THEME.
+  pyramiding.should_add()의 THEME_WEAKENED도 같은 규칙. 기본값은 False(기존 동작) -
+  백테스트 결과가 나빠 사용자가 적용 보류(config.py 주석 참고).
 ================================================================================
 """
 
@@ -63,7 +72,10 @@ def check_entry(candidate: Dict[str, Any], config: TradingConfig = DEFAULT_CONFI
         return "WAIT", "WEAK_SECTOR"
 
     theme_score = candidate.get("theme_score")
-    if theme_score is None or theme_score < config.min_theme_score:
+    if theme_score is None:
+        if not config.skip_theme_check_if_unmapped:
+            return "WAIT", "WEAK_THEME"
+    elif theme_score < config.min_theme_score:
         return "WAIT", "WEAK_THEME"
 
     atr20 = candidate.get("atr20")
