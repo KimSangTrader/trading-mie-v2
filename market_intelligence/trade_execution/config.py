@@ -106,7 +106,10 @@ class TradingConfig:
     필드를 직접 고치지 않고 dataclasses.replace()로 새 인스턴스를 만든다)."""
 
     # ---------- 계좌/자금 ----------
-    total_capital: float = 7_000_000.0          # 계좌 총액(문서 예시값, 실전에는 KIS 잔고조회로 대체 권장)
+    # 【2026-10-28】실전투자 전환(MIE_TRADE_ENVIRONMENT=production)과 함께 실전 계좌 잔고
+    # (4,786,151원, 보유 0종목)에 맞춰 700만원(문서 예시값) -> 478만원으로 사용자가 변경.
+    # 종목당 위험 0.5% = 약 23,900원, 종목당 최대 15% = 약 717,000원. 입출금 시 다시 맞출 것.
+    total_capital: float = 4_780_000.0          # 계좌 총액(위험/비중 계산 기준)
     cash_reserve_ratio: float = 0.10             # 항상 남겨둘 현금 비율
     max_investment_ratio: float = 0.90           # 총 계좌에서 실제 주식에 투입할 최대 비율
 
