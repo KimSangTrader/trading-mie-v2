@@ -381,3 +381,70 @@ class TestBalanceCache:
         orders.spendable_cash = 4_000_000.0
         assert monitor._available_cash(NOW + timedelta(minutes=7)) == 4_000_000.0
         assert monitor._cash_ceiling is None
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, text, key=None):
+        self.sent.append((key, text))
+        return True
+
+
+class FailingOrderClient(MockOrderClient):
+    def place_order(self, ticker, side, quantity, price=None, order_type="market"):
+        self.orders.append({"ticker": ticker, "side": side, "quantity": quantity})
+        return {"success": False, "order_no": None, "message": "EGW00215 초당 거래건수 초과"}
+
+
+class TestAlerts:
+    """【2026-10-30】주문 실패/예외 텔레그램 알림."""
+
+    def test_stop_sell_failure_alerts(self, session_factory):
+        _add_position(session_factory)
+        _add_price_history(session_factory)
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"005930": _quote(8_950.0)}),
+                                      FailingOrderClient(), notifier=notifier)
+
+        for _ in range(3):
+            monitor.run_tick(NOW)
+
+        assert [k for k, _ in notifier.sent] == ["stop_fail:005930"]
+        assert "손절 매도 주문 실패" in notifier.sent[0][1] and "EGW00215" in notifier.sent[0][1]
+        s = session_factory()
+        assert s.query(TradePosition).one().status == "OPEN"  # 실패했으니 포지션은 그대로
+        s.close()
+
+    def test_entry_order_failure_alerts(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}),
+                                      FailingOrderClient(), notifier=notifier)
+
+        monitor.run_cycle(NOW, include_trading=True)
+
+        assert [k for k, _ in notifier.sent] == ["order_fail:신규진입 매수:000660"]
+
+    def test_trading_tick_exception_alerts(self, session_factory):
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), MockOrderClient(), notifier=notifier)
+        monitor._ranking = lambda session, today: (_ for _ in ()).throw(RuntimeError("db down"))
+
+        monitor.run_trading_tick(NOW, {})
+
+        assert notifier.sent[0][0] == "exception:trading_tick"
+        assert "db down" in notifier.sent[0][1]
+
+    def test_success_sends_no_alert(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}),
+                                      MockOrderClient(), notifier=notifier)
+
+        monitor.run_cycle(NOW, include_trading=True)
+
+        assert notifier.sent == []

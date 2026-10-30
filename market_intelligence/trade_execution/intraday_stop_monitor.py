@@ -70,6 +70,14 @@ IntradayStopMonitor - 장중 손절 감시 + 장중 매매 (1분 주기: 손절,
   않아 같은 돈을 두 번 쓰지 않도록 보수적으로 막는 것. 매도 대금은 장중에 더하지 않는다.
 - 같은 날 함께: 시세/주문 환경이 같으면 KISClient 하나를 공유(__main__) - 토큰 1분당 1회 제한 회피.
 
+【2026-10-30】텔레그램 알림 (market_intelligence/utils/notifier.py)
+- 실전 전환 후 주문 실패/예외가 로그에만 남던 문제. 알림 대상:
+    · 손절 매도 주문 실패(가장 위험 - 1분마다 재시도 중임을 함께 알림)
+    · 청산/피라미딩/신규진입 주문 실패(파이프라인 errors)
+    · 손절 감시 틱/매매 틱 처리 중 예외(그 1분 동안 손절 점검이 멈춤)
+    · 장중 루프 프로세스 비정상 종료(__main__)
+- 같은 종류·종목 알림은 10분에 한 번만(notifier 쿨다운). notifier=None(테스트 기본)이면 보내지 않는다.
+
 사용법:
     python -m market_intelligence.trade_execution.intraday_stop_monitor            # 장중 상시 감시+매매
     python -m market_intelligence.trade_execution.intraday_stop_monitor --once     # 1틱만 실행(점검용)
@@ -183,6 +191,7 @@ class IntradayStopMonitor:
         exit_config: ExitConfig = DEFAULT_EXIT_CONFIG,
         trading_config: TradingConfig = DEFAULT_CONFIG,
         dry_run: bool = False,
+        notifier=None,
     ):
         self.session_factory = session_factory
         self.quote_client = quote_client
@@ -191,6 +200,7 @@ class IntradayStopMonitor:
         self.exit_config = exit_config
         self.trading_config = trading_config
         self.dry_run = dry_run
+        self.notifier = notifier  # 【2026-10-30】TelegramNotifier 또는 None(알림 없음)
         self.breach_counts: Dict[int, int] = {}
         self.atr_cache: Dict[Tuple[str, str], Optional[float]] = {}
         self.last_heartbeat: Optional[datetime] = None
@@ -201,6 +211,11 @@ class IntradayStopMonitor:
         self._cash: Optional[float] = None             # 【2026-10-30】잔고 캐시(spendable_cash)
         self._cash_at: Optional[datetime] = None       # 마지막 조회 성공 시각(None이면 다음에 재조회)
         self._cash_ceiling: Optional[float] = None     # 매수 직후 KIS 반영 전까지 쓸 수 있는 현금 상한
+
+    def _alert(self, text: str, key: str) -> None:
+        """텔레그램 알림(설정 없으면 무시). notifier.send()는 예외를 올리지 않는다."""
+        if self.notifier is not None:
+            self.notifier.send(text, key=key)
 
     def _atr20(self, session, ticker: str, today: str) -> Optional[float]:
         key = (ticker, today)
@@ -280,6 +295,12 @@ class IntradayStopMonitor:
                     else:
                         session.rollback()
                         logger.error(f"❌ {ticker}: 장중 손절 매도 주문 실패 - {order.get('message')} (다음 틱 재시도)")
+                        self._alert(
+                            f"🚨 손절 매도 주문 실패: {ticker} {qty}주 ({reason})\n"
+                            f"현재가 {current_price:,.0f} / 손절가 {pos_dict['stop_price']:,.0f}\n"
+                            f"사유: {order.get('message')}\n1분마다 자동 재시도 중 - 계좌를 직접 확인하세요.",
+                            key=f"stop_fail:{ticker}",
+                        )
                     continue
 
                 if reason == "STOP_BREACH_PENDING":
@@ -313,9 +334,11 @@ class IntradayStopMonitor:
                     f"{ticker} 현재가 {current_price:,.0f} 손절가 {stop_now:,.0f} "
                     f"(여유 {(current_price - stop_now) / current_price * 100:+.1f}%)"
                 )
-        except Exception:
+        except Exception as e:
             session.rollback()
             logger.exception("❌ 장중 감시 틱 처리 중 예외 - 다음 틱에 재시도")
+            self._alert(f"⚠️ 장중 손절 감시 처리 중 예외 - 이번 1분 손절 점검 중단, 다음 틱 재시도\n{type(e).__name__}: {e}",
+                        key="exception:stop_tick")
         finally:
             session.close()
 
@@ -533,9 +556,10 @@ class IntradayStopMonitor:
                     dry_run=self.dry_run, excluded_tickers=excluded, skip_log=self._log_skip,
                 )
                 self._record_spend(self._buy_amount_since(session, history_id), base=available_cash)
-        except Exception:
+        except Exception as e:
             session.rollback()
             logger.exception("❌ 장중 매매 틱 처리 중 예외 - 다음 틱에 재시도")
+            self._alert(f"⚠️ 장중 매매 처리 중 예외 - 다음 틱 재시도\n{type(e).__name__}: {e}", key="exception:trading_tick")
         finally:
             pipeline_logger.setLevel(previous_level)
             cleanup()
@@ -549,6 +573,12 @@ class IntradayStopMonitor:
                 f"추가매수 {pyr_r.get('added', 0)}, 신규진입 {entry_r.get('entered', 0)}"
                 + (f", 오류 {errors}" if errors else "")
             )
+        for label, errs in (("청산 매도", exit_r.get("errors", [])), ("추가매수", pyr_r.get("errors", [])),
+                            ("신규진입 매수", entry_r.get("errors", []))):
+            for err in errs:
+                ticker = err.get("ticker")
+                self._alert(f"🚨 {label} 주문 실패: {ticker} {err.get('action', '')}\n사유: {err.get('message')}",
+                            key=f"order_fail:{label}:{ticker}")
         return result
 
     def _fetch_quotes(self, session_tickers: set) -> Dict[str, Dict[str, Any]]:
@@ -641,8 +671,18 @@ if __name__ == "__main__":
     # 클라이언트가 토큰 없이 시작했다. 환경이 다르면(모의투자 주문) 기존처럼 별도 인스턴스.
     order_client = quote_client if quote_client.environment == trade_environment else KISClient(environment=trade_environment)
 
-    monitor = IntradayStopMonitor(SessionLocal, quote_client, order_client, dry_run=args.dry_run)
-    if args.once:
-        print(monitor.run_cycle(datetime.now(KST), include_trading=DEFAULT_INTRADAY_MONITOR_CONFIG.intraday_trading_enabled))
-    else:
-        monitor.run_forever()
+    from market_intelligence.utils.notifier import TelegramNotifier
+    env_label = "DRY-RUN" if args.dry_run else ("실전" if trade_environment == "production" else "모의")
+    notifier = TelegramNotifier(prefix=f"[MIE {env_label}] ")
+
+    monitor = IntradayStopMonitor(SessionLocal, quote_client, order_client, dry_run=args.dry_run, notifier=notifier)
+    try:
+        if args.once:
+            print(monitor.run_cycle(datetime.now(KST), include_trading=DEFAULT_INTRADAY_MONITOR_CONFIG.intraday_trading_enabled))
+        else:
+            monitor.run_forever()
+    except BaseException as e:  # KeyboardInterrupt/systemd 종료 포함 - 알리고 그대로 다시 올린다
+        if not isinstance(e, SystemExit) or e.code not in (0, None):
+            notifier.send(f"🛑 장중 루프 비정상 종료 - 오늘 남은 시간 손절 감시/매매 없음\n{type(e).__name__}: {e}",
+                          key="process_crash")
+        raise
