@@ -58,6 +58,18 @@ IntradayStopMonitor - 장중 손절 감시 + 장중 매매 (1분 주기: 손절,
       실제 매매/오류가 있을 때만 기록.
 - --dry-run에서는 파이프라인이 내부에서 commit해도 바깥 트랜잭션을 rollback해 DB에 남지 않는다.
 
+【2026-10-30】잔고조회 캐싱 (_available_cash) - KIS 원장 초당 한도 회피
+- 배경: 실전 전환(10/28) 후 시세/잔고/주문이 같은 실전 앱키를 쓰면서 잔고조회 EGW00215
+  (원장 초당 거래건수 초과)가 10/29 하루 62건, 재시도 후에도 실패 12건. 주문(POST)은
+  재시도하지 않으므로 원장 호출 자체를 줄여 주문이 한도에 걸릴 여지를 줄인다.
+- 잔고(spendable_cash)는 balance_cache_seconds(5분) 동안 재사용. 조회 실패 시 마지막
+  성공값을 쓰고, 성공값이 한 번도 없으면 기존처럼 0(신규진입 안 함).
+- 매수(피라미딩/신규진입) 직후엔 캐시를 버려 다음 틱에 재조회하되, "매수 직전 잔고 -
+  매수 대금"을 상한(_cash_ceiling)으로 둔다. KIS 조회값이 상한 이하로 내려오면(매수 반영
+  확인) 상한을 해제 - spendable_cash가 당일 매수를 즉시 반영하는지 아직 실거래로 검증되지
+  않아 같은 돈을 두 번 쓰지 않도록 보수적으로 막는 것. 매도 대금은 장중에 더하지 않는다.
+- 같은 날 함께: 시세/주문 환경이 같으면 KISClient 하나를 공유(__main__) - 토큰 1분당 1회 제한 회피.
+
 사용법:
     python -m market_intelligence.trade_execution.intraday_stop_monitor            # 장중 상시 감시+매매
     python -m market_intelligence.trade_execution.intraday_stop_monitor --once     # 1틱만 실행(점검용)
@@ -186,6 +198,9 @@ class IntradayStopMonitor:
         self._ranking_cache_day: Optional[str] = None
         self._daily_cache: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
         self._last_skip: Dict[str, str] = {}
+        self._cash: Optional[float] = None             # 【2026-10-30】잔고 캐시(spendable_cash)
+        self._cash_at: Optional[datetime] = None       # 마지막 조회 성공 시각(None이면 다음에 재조회)
+        self._cash_ceiling: Optional[float] = None     # 매수 직후 KIS 반영 전까지 쓸 수 있는 현금 상한
 
     def _atr20(self, session, ticker: str, today: str) -> Optional[float]:
         key = (ticker, today)
@@ -407,6 +422,45 @@ class IntradayStopMonitor:
             self._last_skip[ticker] = message
             logger.info(message.strip())
 
+    def _available_cash(self, now: datetime) -> float:
+        """잔고조회 캐시(변경이력 【2026-10-30】). balance_cache_seconds 안이면 재조회하지 않는다."""
+        cached = self._cash_at is not None and (now - self._cash_at).total_seconds() < self.monitor_config.balance_cache_seconds
+        if not cached:
+            balance = self.order_client.get_balance(verbose=False)
+            fresh = (balance or {}).get("cash", {}).get("spendable_cash")
+            if fresh is not None:
+                fresh = float(fresh)
+                if self._cash_ceiling is not None and fresh <= self._cash_ceiling:
+                    self._cash_ceiling = None  # KIS가 당일 매수를 반영함 - 상한 해제
+                self._cash, self._cash_at = fresh, now
+            elif self._cash is None:
+                return 0.0  # 조회 실패 + 성공값 없음 - 기존 동작(신규진입 안 함)
+        if self._cash_ceiling is not None:
+            self._cash = min(self._cash, self._cash_ceiling)
+        return self._cash
+
+    def _record_spend(self, spent: float, base: Optional[float]) -> None:
+        """매수 대금 반영: 다음 틱에 재조회하되 base - spent를 상한으로 둔다."""
+        if spent <= 0:
+            return
+        self._cash_at = None
+        if base is None:
+            return  # 기준 잔고를 모름 - 다음 조회값을 그대로 쓴다
+        self._cash_ceiling = max(base - spent, 0.0)
+        self._cash = self._cash_ceiling
+
+    @staticmethod
+    def _last_history_id(session) -> int:
+        from sqlalchemy import func
+        from db.models import TradingHistory
+        return session.query(func.max(TradingHistory.id)).scalar() or 0
+
+    @staticmethod
+    def _buy_amount_since(session, history_id: int) -> float:
+        from db.models import TradingHistory
+        rows = session.query(TradingHistory).filter(TradingHistory.id > history_id, TradingHistory.trade_type == "BUY").all()
+        return float(sum((r.quantity or 0) * float(r.price or 0) for r in rows))
+
     def run_trading_tick(self, now: datetime, quotes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """현재가 + 전일 기준 일간 데이터로 market_data/후보를 조립해 기존 파이프라인
         (청산 -> 피라미딩 -> 신규진입)을 그대로 실행한다. 손절은 run_tick()이 이미 처리했으므로
@@ -465,17 +519,20 @@ class IntradayStopMonitor:
 
             result["exit"] = pipeline.run_exit_pipeline(
                 session, self.order_client, market_data, self.trading_config, self.exit_config, dry_run=self.dry_run)
+            history_id = self._last_history_id(session)
             result["pyramiding"] = pipeline.run_pyramiding_pipeline(
                 session, self.order_client, market_data, self.trading_config, dry_run=self.dry_run)
+            self._record_spend(self._buy_amount_since(session, history_id), base=self._cash)
 
             open_count = session.query(TradePosition).filter(TradePosition.status == "OPEN").count()
             if ranked_candidates and open_count < self.trading_config.max_positions:
-                balance = self.order_client.get_balance(verbose=False)
-                available_cash = (balance or {}).get("cash", {}).get("spendable_cash", 0.0)
+                available_cash = self._available_cash(now)
+                history_id = self._last_history_id(session)
                 result["entry"] = pipeline.run_entry_pipeline(
                     session, self.order_client, ranked_candidates, available_cash, self.trading_config,
                     dry_run=self.dry_run, excluded_tickers=excluded, skip_log=self._log_skip,
                 )
+                self._record_spend(self._buy_amount_since(session, history_id), base=available_cash)
         except Exception:
             session.rollback()
             logger.exception("❌ 장중 매매 틱 처리 중 예외 - 다음 틱에 재시도")
@@ -579,7 +636,10 @@ if __name__ == "__main__":
     print(f"⚠️  매매 실행 환경: {trade_environment} "
           f"({'실전투자 - 진짜 주문' if trade_environment == 'production' else '모의투자'})")
     quote_client = KISClient()
-    order_client = KISClient(environment=trade_environment)
+    # 【2026-10-30】실전 전환 후 시세/주문 환경이 같으면(같은 앱키) 클라이언트를 공유한다 - 따로 만들면
+    # 두 번째 토큰 발급이 KIS 1분당 1회 제한(EGW00133, 403)에 걸려 10/29 09:05 첫 매매 틱에 주문용
+    # 클라이언트가 토큰 없이 시작했다. 환경이 다르면(모의투자 주문) 기존처럼 별도 인스턴스.
+    order_client = quote_client if quote_client.environment == trade_environment else KISClient(environment=trade_environment)
 
     monitor = IntradayStopMonitor(SessionLocal, quote_client, order_client, dry_run=args.dry_run)
     if args.once:

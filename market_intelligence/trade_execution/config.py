@@ -235,6 +235,7 @@ class IntradayMonitorConfig:
     trade_start: str = "09:05"                     # 장중 매매(손절 외) 시작 - 기존 하루 1회 사이클 시각과 동일
     trade_end: str = "15:15"                       # 장중 매매 종료(종가 단일가 전 여유)
     reentry_block_hours: int = 16                  # 이 시간 안에 청산된 종목은 신규진입 후보에서 제외(당일 재진입 금지)
+    balance_cache_seconds: int = 300               # 【2026-10-30】잔고조회 결과 재사용 시간(초) - KIS 원장 초당 한도(EGW00215) 회피
 
 
 DEFAULT_INTRADAY_MONITOR_CONFIG = IntradayMonitorConfig()

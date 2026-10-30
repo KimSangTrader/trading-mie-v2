@@ -3,7 +3,7 @@
 판정 함수(judge_intraday_stop)는 순수 함수로, run_tick()은 Mock 시세/주문
 클라이언트 + SQLite in-memory DB로 검증한다(test_trade_execution_pipeline.py와
 동일한 패턴)."""
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -313,3 +313,71 @@ class TestIntradayTrading:
         assert s.query(TradePosition).count() == 0
         assert s.query(TradingHistory).count() == 0
         s.close()
+
+
+class CountingOrderClient(MockOrderClient):
+    """잔고조회 횟수를 세고, None을 넣으면 조회 실패(빈 dict)를 흉내 낸다."""
+
+    def __init__(self, spendable_cash=10_000_000.0):
+        super().__init__(spendable_cash)
+        self.balance_calls = 0
+
+    def get_balance(self, verbose=True):
+        self.balance_calls += 1
+        if self.spendable_cash is None:
+            return {}
+        return super().get_balance(verbose)
+
+
+class TestBalanceCache:
+    """【2026-10-30】잔고조회 캐싱 - KIS 원장 초당 한도(EGW00215) 회피."""
+
+    def _waiting_candidate(self, session_factory):
+        """후보는 있지만 섹터 미달로 진입하지 않는 상태(매 틱 잔고가 필요한 상황)."""
+        _add_ranking(session_factory, sector=50.0)
+        _add_price_history(session_factory, ticker="000660")
+
+    def test_reuses_balance_within_cache_window(self, session_factory):
+        self._waiting_candidate(session_factory)
+        orders = CountingOrderClient()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}), orders)
+
+        for minute in range(5):  # 10:00~10:04 - 5분(300초) 안
+            monitor.run_cycle(NOW + timedelta(minutes=minute), include_trading=True)
+        assert orders.balance_calls == 1
+
+        monitor.run_cycle(NOW + timedelta(minutes=5), include_trading=True)
+        assert orders.balance_calls == 2
+
+    def test_failure_uses_last_good_value(self, session_factory):
+        orders = CountingOrderClient(spendable_cash=3_000_000.0)
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), orders)
+        assert monitor._available_cash(NOW) == 3_000_000.0
+
+        orders.spendable_cash = None
+        assert monitor._available_cash(NOW + timedelta(minutes=10)) == 3_000_000.0
+
+    def test_failure_without_any_good_value_returns_zero(self, session_factory):
+        orders = CountingOrderClient(spendable_cash=None)
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), orders)
+        assert monitor._available_cash(NOW) == 0.0
+
+    def test_buy_forces_refresh_and_caps_cash_until_kis_reflects_it(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")
+        orders = CountingOrderClient(spendable_cash=5_000_000.0)
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}), orders)
+
+        monitor.run_cycle(NOW, include_trading=True)
+        assert orders.orders[0]["side"] == "buy"
+        spent = orders.orders[0]["quantity"] * 10_100.0
+        assert orders.balance_calls == 1
+
+        # KIS가 아직 매수를 반영하지 않음(5,000,000 그대로) -> 상한(매수 전 - 매수 대금) 적용, 즉시 재조회
+        assert monitor._available_cash(NOW + timedelta(minutes=1)) == pytest.approx(5_000_000.0 - spent)
+        assert orders.balance_calls == 2
+
+        # KIS 반영 후(상한 이하로 내려옴) -> 상한 해제, KIS 값을 그대로 사용
+        orders.spendable_cash = 4_000_000.0
+        assert monitor._available_cash(NOW + timedelta(minutes=7)) == 4_000_000.0
+        assert monitor._cash_ceiling is None
