@@ -438,7 +438,7 @@ class TestAlerts:
         assert notifier.sent[0][0] == "exception:trading_tick"
         assert "db down" in notifier.sent[0][1]
 
-    def test_success_sends_no_alert(self, session_factory):
+    def test_entry_success_sends_one_fill_alert(self, session_factory):
         _add_ranking(session_factory)
         _add_price_history(session_factory, ticker="000660")
         notifier = RecordingNotifier()
@@ -446,5 +446,85 @@ class TestAlerts:
                                       MockOrderClient(), notifier=notifier)
 
         monitor.run_cycle(NOW, include_trading=True)
+        monitor.run_cycle(NOW, include_trading=True)  # 다음 틱엔 같은 종목을 다시 사지 않음 - 알림도 없음
+
+        assert len(notifier.sent) == 1
+        key, text = notifier.sent[0]
+        assert key is None
+        assert "신규진입 매수 주문 접수: 000660" in text and "기록가 10,100원" in text and "손절가" in text
+
+    def test_stop_sell_success_sends_fill_alert(self, session_factory):
+        _add_position(session_factory)
+        _add_price_history(session_factory)
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"005930": _quote(8_950.0)}),
+                                      MockOrderClient(), notifier=notifier)
+
+        for _ in range(3):
+            monitor.run_tick(NOW)
+
+        assert len(notifier.sent) == 1
+        assert "손절 매도 주문 접수: 005930 35주" in notifier.sent[0][1]
+
+    def test_dry_run_sends_no_fill_alert(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}),
+                                      MockOrderClient(), notifier=notifier, dry_run=True)
+
+        monitor.run_cycle(NOW, include_trading=True)
 
         assert notifier.sent == []
+
+
+class BalanceOrderClient(MockOrderClient):
+    def __init__(self, total=4_786_151.0, positions=()):
+        super().__init__()
+        self.total, self.positions = total, list(positions)
+
+    def get_balance(self, verbose=True):
+        return {"cash": {"spendable_cash": self.total, "total_evaluation_amount": self.total},
+                "positions": self.positions}
+
+
+class TestDailySummary:
+    """【2026-10-30】장 마감 요약."""
+
+    def test_counts_positions_and_balance_change(self, session_factory):
+        _add_position(session_factory)  # 005930 35주, 평균 10,000, 손절 9,000
+        orders = BalanceOrderClient(total=4_800_000.0, positions=[{"ticker": "005930", "quantity": 35}])
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), orders)
+        monitor._opening_total = 4_786_151.0
+        monitor._last_quotes = {"005930": _quote(10_500.0)}
+        monitor._count("entered")
+        monitor._count("order_failures", 2)
+
+        text = monitor.daily_summary_text(NOW, orders.get_balance())
+
+        assert "📊 장 마감 요약 2026-10-15(목)" in text
+        assert "신규진입 1" in text and "주문 실패 2" in text
+        assert "005930 35주 평균 10,000 현재 10,500 손절 9,000 (여유 +14.3%)" in text
+        assert "계좌 총평가 4,800,000원 (장 시작 대비 +13,849원)" in text
+        assert "DB-계좌 보유수량 일치" in text
+
+    def test_flags_db_account_mismatch(self, session_factory):
+        _add_position(session_factory)
+        orders = BalanceOrderClient(positions=[{"ticker": "005930", "quantity": 30}, {"ticker": "000660", "quantity": 5}])
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), orders)
+
+        text = monitor.daily_summary_text(NOW, orders.get_balance())
+
+        assert "⚠️ DB-계좌 보유 불일치: 000660 DB 0주 / 계좌 5주, 005930 DB 35주 / 계좌 30주" in text
+
+    def test_balance_failure_is_flagged(self, session_factory):
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), MockOrderClient())
+        assert "계좌 잔고 조회 실패" in monitor.daily_summary_text(NOW, {})
+
+    def test_holiday_summary_and_send(self, session_factory):
+        notifier = RecordingNotifier()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({}), MockOrderClient(), notifier=notifier)
+
+        monitor.send_daily_summary(NOW, holiday=True)
+
+        assert "KRX 휴장일" in notifier.sent[0][1]

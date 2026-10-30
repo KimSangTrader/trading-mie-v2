@@ -77,6 +77,13 @@ IntradayStopMonitor - 장중 손절 감시 + 장중 매매 (1분 주기: 손절,
     · 손절 감시 틱/매매 틱 처리 중 예외(그 1분 동안 손절 점검이 멈춤)
     · 장중 루프 프로세스 비정상 종료(__main__)
 - 같은 종류·종목 알림은 10분에 한 번만(notifier 쿨다운). notifier=None(테스트 기본)이면 보내지 않는다.
+- 같은 날 추가(사용자 요청): 체결 알림 + 장 마감 요약.
+    · 체결 알림: 손절 매도/청산/부분익절/추가매수/신규진입 주문이 접수될 때마다 1건(쿨다운 없음).
+      시장가 주문 "접수"까지만 확인하고 실제 체결가는 조회하지 않으므로, 가격은 "기록가(주문 시점
+      현재가)"로 표시한다. dry_run에서는 보내지 않는다.
+    · 장 마감 요약(send_daily_summary): 15:20 종료 시 1건 - 당일 매매/주문실패/예외 건수, 보유 종목
+      (현재가/손절가/여유), 계좌 총평가와 장 시작 대비 증감, DB OPEN 포지션과 실제 계좌 보유수량
+      대조(불일치 시 ⚠️). 휴장일에도 1건 보내서 "알림이 안 온 날 = 루프가 안 돈 날"이 되게 한다.
 
 사용법:
     python -m market_intelligence.trade_execution.intraday_stop_monitor            # 장중 상시 감시+매매
@@ -201,6 +208,9 @@ class IntradayStopMonitor:
         self.trading_config = trading_config
         self.dry_run = dry_run
         self.notifier = notifier  # 【2026-10-30】TelegramNotifier 또는 None(알림 없음)
+        self._stats: Dict[str, int] = {}               # 【2026-10-30】장 마감 요약용 당일 집계
+        self._opening_total: Optional[float] = None    # 장 시작 시 계좌 총평가(요약의 증감 기준)
+        self._last_quotes: Dict[str, Dict[str, Any]] = {}
         self.breach_counts: Dict[int, int] = {}
         self.atr_cache: Dict[Tuple[str, str], Optional[float]] = {}
         self.last_heartbeat: Optional[datetime] = None
@@ -212,10 +222,35 @@ class IntradayStopMonitor:
         self._cash_at: Optional[datetime] = None       # 마지막 조회 성공 시각(None이면 다음에 재조회)
         self._cash_ceiling: Optional[float] = None     # 매수 직후 KIS 반영 전까지 쓸 수 있는 현금 상한
 
-    def _alert(self, text: str, key: str) -> None:
+    def _alert(self, text: str, key: Optional[str]) -> None:
         """텔레그램 알림(설정 없으면 무시). notifier.send()는 예외를 올리지 않는다."""
         if self.notifier is not None:
             self.notifier.send(text, key=key)
+
+    def _count(self, name: str, n: int = 1) -> None:
+        self._stats[name] = self._stats.get(name, 0) + n
+
+    def _fill_alerts(self, session, history_id: int) -> List[str]:
+        """이번 틱 매매 파이프라인이 남긴 TradingHistory로 체결(주문 접수) 알림 문구를 만든다."""
+        from db.models import TradePosition, TradingHistory
+
+        labels = {"ENTRY": "신규진입 매수", "PYRAMID": "추가매수", "EXIT": "매도"}
+        texts = []
+        rows = session.query(TradingHistory).filter(TradingHistory.id > history_id).order_by(TradingHistory.id).all()
+        for h in rows:
+            source = h.signal_source or ""
+            label = labels.get(source.split("_", 1)[0], h.trade_type)
+            if source == "EXIT_TAKE_PROFIT_2R":
+                label = "부분익절 매도"
+            price = float(h.price) if h.price is not None else None
+            text = (f"✅ {label} 주문 접수: {h.ticker} {h.quantity}주\n"
+                    f"기록가 {price:,.0f}원 (주문 시점 현재가, 실제 체결가는 계좌에서 확인)\n사유: {source}")
+            if h.trade_type == "BUY":
+                pos = session.query(TradePosition).filter(TradePosition.ticker == h.ticker, TradePosition.status == "OPEN").first()
+                if pos is not None and pos.stop_price is not None:
+                    text += f"\n보유 {pos.quantity}주 · 손절가 {float(pos.stop_price):,.0f}원"
+            texts.append(text)
+        return texts
 
     def _atr20(self, session, ticker: str, today: str) -> Optional[float]:
         key = (ticker, today)
@@ -287,6 +322,14 @@ class IntradayStopMonitor:
                         self._commit(session)
                         self.breach_counts.pop(position_id, None)
                         result["sold_all"] += 1
+                        self._count("stop_sold")
+                        if not self.dry_run:
+                            self._alert(
+                                f"🛑 손절 매도 주문 접수: {ticker} {qty}주 ({reason})\n"
+                                f"기록가 {current_price:,.0f}원 / 손절가 {pos_dict['stop_price']:,.0f}원\n"
+                                f"주문번호 {order.get('order_no')} (실제 체결가는 계좌에서 확인)",
+                                key=None,
+                            )
                         logger.info(
                             f"🛑 {ticker}: 장중 손절 전량매도 {qty}주 - {reason} "
                             f"(현재가 {current_price:,.0f} / 손절가 {pos_dict['stop_price']:,.0f} / "
@@ -295,6 +338,7 @@ class IntradayStopMonitor:
                     else:
                         session.rollback()
                         logger.error(f"❌ {ticker}: 장중 손절 매도 주문 실패 - {order.get('message')} (다음 틱 재시도)")
+                        self._count("order_failures")
                         self._alert(
                             f"🚨 손절 매도 주문 실패: {ticker} {qty}주 ({reason})\n"
                             f"현재가 {current_price:,.0f} / 손절가 {pos_dict['stop_price']:,.0f}\n"
@@ -337,6 +381,7 @@ class IntradayStopMonitor:
         except Exception as e:
             session.rollback()
             logger.exception("❌ 장중 감시 틱 처리 중 예외 - 다음 틱에 재시도")
+            self._count("exceptions")
             self._alert(f"⚠️ 장중 손절 감시 처리 중 예외 - 이번 1분 손절 점검 중단, 다음 틱 재시도\n{type(e).__name__}: {e}",
                         key="exception:stop_tick")
         finally:
@@ -497,7 +542,9 @@ class IntradayStopMonitor:
         pipeline_logger = logging.getLogger(pipeline.__name__)
         previous_level = pipeline_logger.level
         pipeline_logger.setLevel(logging.WARNING)  # 파이프라인의 1분마다 반복되는 요약 로그 억제
+        fill_texts: List[str] = []
         try:
+            tick_history_id = self._last_history_id(session)
             ranking = self._ranking(session, today)
             open_tickers = {t for (t,) in session.query(TradePosition.ticker).filter(TradePosition.status == "OPEN").all()}
             excluded = self._recently_closed(session, now)
@@ -556,9 +603,11 @@ class IntradayStopMonitor:
                     dry_run=self.dry_run, excluded_tickers=excluded, skip_log=self._log_skip,
                 )
                 self._record_spend(self._buy_amount_since(session, history_id), base=available_cash)
+            fill_texts = self._fill_alerts(session, tick_history_id)
         except Exception as e:
             session.rollback()
             logger.exception("❌ 장중 매매 틱 처리 중 예외 - 다음 틱에 재시도")
+            self._count("exceptions")
             self._alert(f"⚠️ 장중 매매 처리 중 예외 - 다음 틱 재시도\n{type(e).__name__}: {e}", key="exception:trading_tick")
         finally:
             pipeline_logger.setLevel(previous_level)
@@ -573,6 +622,14 @@ class IntradayStopMonitor:
                 f"추가매수 {pyr_r.get('added', 0)}, 신규진입 {entry_r.get('entered', 0)}"
                 + (f", 오류 {errors}" if errors else "")
             )
+        self._count("entered", entry_r.get("entered", 0))
+        self._count("pyramid_added", pyr_r.get("added", 0))
+        self._count("exit_sold", exit_r.get("sold_all", 0))
+        self._count("partial_sold", exit_r.get("partial_sold", 0))
+        self._count("order_failures", len(errors))
+        if not self.dry_run:
+            for text in fill_texts:
+                self._alert(text, key=None)
         for label, errs in (("청산 매도", exit_r.get("errors", [])), ("추가매수", pyr_r.get("errors", [])),
                             ("신규진입 매수", entry_r.get("errors", []))):
             for err in errs:
@@ -603,10 +660,69 @@ class IntradayStopMonitor:
             session.close()
 
         quotes = self._fetch_quotes(tickers)
+        self._last_quotes.update(quotes)
         result = {"stop": self.run_tick(now, quotes)}
         if include_trading:
             result["trading"] = self.run_trading_tick(now, quotes)
         return result
+
+    def daily_summary_text(self, now: datetime, balance: Optional[Dict[str, Any]], holiday: bool = False) -> str:
+        """장 마감 요약 문구(순수 조립 - 조회는 호출측). balance는 get_balance() 결과 또는 None/{}."""
+        from db.models import TradePosition
+
+        weekday = "월화수목금토일"[now.weekday()]
+        head = f"📊 장 마감 요약 {now:%Y-%m-%d}({weekday})"
+        if holiday:
+            return f"{head}\nKRX 휴장일 - 장중 감시·매매 없음 (루프는 정상 기동)"
+
+        st = self._stats.get
+        lines = [
+            head,
+            f"매매: 신규진입 {st('entered', 0)} · 추가매수 {st('pyramid_added', 0)} · 청산 {st('exit_sold', 0)} · "
+            f"부분익절 {st('partial_sold', 0)} · 손절 {st('stop_sold', 0)}",
+            f"주문 실패 {st('order_failures', 0)} · 처리 예외 {st('exceptions', 0)}",
+        ]
+
+        session = self.session_factory()
+        try:
+            positions = session.query(TradePosition).filter(TradePosition.status == "OPEN").order_by(TradePosition.ticker).all()
+            db_qty = {p.ticker: p.quantity or 0 for p in positions}
+            lines.append(f"보유 {len(positions)}종목")
+            for p in positions:
+                price = (self._last_quotes.get(p.ticker) or {}).get("current_price")
+                stop = float(p.stop_price) if p.stop_price is not None else None
+                avg = float(p.average_price) if p.average_price is not None else None
+                gap = f" (여유 {(price - stop) / price * 100:+.1f}%)" if price and stop else ""
+                lines.append(
+                    f"  {p.ticker} {p.quantity}주 평균 {avg:,.0f} 현재 {price:,.0f} 손절 {stop:,.0f}{gap}"
+                    if price and avg and stop else f"  {p.ticker} {p.quantity}주 (시세/손절가 없음)"
+                )
+        finally:
+            session.close()
+
+        if not balance:
+            lines.append("⚠️ 계좌 잔고 조회 실패 - 계좌를 직접 확인하세요")
+            return "\n".join(lines)
+
+        total = (balance.get("cash") or {}).get("total_evaluation_amount")
+        if total is not None:
+            change = f" (장 시작 대비 {total - self._opening_total:+,.0f}원)" if self._opening_total is not None else ""
+            lines.append(f"계좌 총평가 {total:,.0f}원{change}")
+
+        kis_qty = {b.get("ticker"): int(b.get("quantity") or 0) for b in balance.get("positions") or []}
+        mismatches = [
+            f"{t} DB {db_qty.get(t, 0)}주 / 계좌 {kis_qty.get(t, 0)}주"
+            for t in sorted(set(db_qty) | set(kis_qty)) if db_qty.get(t, 0) != kis_qty.get(t, 0)
+        ]
+        if mismatches:
+            lines.append("⚠️ DB-계좌 보유 불일치: " + ", ".join(mismatches))
+        else:
+            lines.append("DB-계좌 보유수량 일치 ✅")
+        return "\n".join(lines)
+
+    def send_daily_summary(self, now: datetime, holiday: bool = False) -> None:
+        balance = None if holiday else self.order_client.get_balance(verbose=False)
+        self._alert(self.daily_summary_text(now, balance, holiday=holiday), key=None)
 
     def run_forever(self) -> None:
         from data.krx_calendar import is_krx_trading_day
@@ -617,7 +733,11 @@ class IntradayStopMonitor:
         now = datetime.now(KST)
         if not is_krx_trading_day(now.date()):
             logger.info(f"ℹ️  {now:%Y-%m-%d}는 KRX 휴장일 - 장중 감시 없이 종료")
+            self.send_daily_summary(now, holiday=True)
             return
+
+        opening = self.order_client.get_balance(verbose=False)
+        self._opening_total = ((opening or {}).get("cash") or {}).get("total_evaluation_amount")
 
         logger.info(
             f"🚀 장중 손절 감시 시작 ({'DRY-RUN' if self.dry_run else '실주문'}) - "
@@ -636,6 +756,7 @@ class IntradayStopMonitor:
             now = datetime.now(KST)
             if now.time() >= close_t:
                 logger.info(f"✅ 장중 감시 종료 ({now:%H:%M} KST)")
+                self.send_daily_summary(now)
                 return
             if now.time() < open_t:
                 time.sleep(min(30, self.monitor_config.poll_interval_sec))
