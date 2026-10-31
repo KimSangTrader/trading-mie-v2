@@ -233,6 +233,18 @@ Valuation)를 등록하고, market_data 대부분(섹터/수급/테마/뉴스/�
   채워지는지 (4) python main.py(시험)로 Step 8 밸류에이션 컴포넌트가 여전히 정상
   범위인지.
 
+【2026-10-30】일봉 저장 시 지난 거래일 공식 종가로 갱신 + 당일 행 보호
+- 배경: 9/14 KRX 애프터마켓(16:00~20:00 실시간) 도입 후 KIS 일봉 API의 "당일" 행은 20:00 마지막
+  체결가/애프터마켓 포함 거래량이고, 다음날부터 공식 종가로 고쳐진다. 22:00에 처음 저장된 임시
+  값이 신규 행만 넣는 저장 방식 때문에 그대로 남아, 9/14 이후 DB 종가가 KRX 공식 종가와 ~80%
+  종목에서 달랐다.
+- 변경: Step 6-1 저장을 update_existing=True + protected_dates={오늘(KST)}로 호출. 매일 밤 받는 60일치로
+  지난 거래일 행이 공식 값으로 고쳐지고, 당일 행은 15:41 market_intelligence/collectors/
+  daily_close_collector.py(신규 타이머)가 넣은 공식 종가를 덮지 않는다(없으면 임시 값으로 넣고
+  다음날 밤 고쳐짐).
+- 한계: TechnicalAnalyzer 등 이 사이클의 분석은 여전히 KIS에서 받은 60일치를 그대로 쓰므로 당일
+  하루치만 20:00 값이다(애프터마켓까지 반영된 최신 가격).
+
 【2026-09-14】일마감 분석 목표 시각 19:00 -> 22:00(KST) 변경
 - 배경: 한국 주식시장 거래시간이 변경되었다는 사용자 고지에 따라, 일마감
   분석(전종목 스크리닝)을 시작하는 목표 시각을 평일 KST 19:00에서 22:00로
@@ -808,10 +820,16 @@ def run_analysis_cycle(manager: IntelligenceManager, analyzers: List[Any],
     if price_rows:
         ph_session = SessionLocal()
         try:
-            ph_result = run_full_price_history_pipeline(ph_session, records=price_rows)
+            # 【2026-10-30】지난 거래일 행은 KIS가 고쳐 준 공식 종가로 덮어쓰고(update_existing), 당일 행은
+            # 15:41 daily_close_collector가 저장한 공식 종가를 이 시각(애프터마켓 20:00 임시 값)으로 덮지
+            # 않는다(protected_dates). 변경이력 【2026-10-30】참고.
+            ph_result = run_full_price_history_pipeline(
+                ph_session, records=price_rows, update_existing=True,
+                protected_dates={datetime.now(KST).strftime("%Y%m%d")},
+            )
             logger.info(
                 f"✅ 일봉 히스토리 저장: {ph_result['total_symbols']}종목, "
-                f"{ph_result['rows_fetched']}행 중 신규 {ph_result['rows_saved']}행"
+                f"{ph_result['rows_fetched']}행 중 신규 {ph_result['rows_saved']}행, 갱신 {ph_result['rows_updated']}행"
             )
         except Exception as e:
             logger.error(f"⚠️  일봉 히스토리 저장 실패(계층형 순위는 계속 진행) - {e}")

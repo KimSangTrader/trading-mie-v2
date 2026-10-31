@@ -528,3 +528,27 @@ class TestDailySummary:
         monitor.send_daily_summary(NOW, holiday=True)
 
         assert "KRX 휴장일" in notifier.sent[0][1]
+
+
+class TestPreviousCloseSource:
+    """【2026-10-30】갭 필터 전일 종가 = KIS 기준가(공식 종가) 우선, DB 일봉 종가(애프터마켓 20:00가)는 대체용."""
+
+    def test_gap_uses_kis_base_price_over_db_close(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")  # DB 전일 종가 10,000
+        orders = MockOrderClient()
+        quote = dict(_quote(10_100.0), base_price=9_500.0)   # 공식 종가 9,500 -> 갭 +6.3%(확인 대기 구간)
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": quote}), orders)
+
+        result = monitor.run_cycle(NOW, include_trading=True)
+
+        assert result["trading"]["entry"]["entered"] == 0
+        assert orders.orders == []
+
+    def test_falls_back_to_db_close_without_base_price(self, session_factory):
+        _add_ranking(session_factory)
+        _add_price_history(session_factory, ticker="000660")
+        orders = MockOrderClient()
+        monitor = IntradayStopMonitor(session_factory, MockQuoteClient({"000660": _quote(10_100.0)}), orders)
+
+        assert monitor.run_cycle(NOW, include_trading=True)["trading"]["entry"]["entered"] == 1

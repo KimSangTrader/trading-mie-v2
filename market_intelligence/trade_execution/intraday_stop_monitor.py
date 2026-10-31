@@ -77,6 +77,9 @@ IntradayStopMonitor - 장중 손절 감시 + 장중 매매 (1분 주기: 손절,
     · 손절 감시 틱/매매 틱 처리 중 예외(그 1분 동안 손절 점검이 멈춤)
     · 장중 루프 프로세스 비정상 종료(__main__)
 - 같은 종류·종목 알림은 10분에 한 번만(notifier 쿨다운). notifier=None(테스트 기본)이면 보내지 않는다.
+- 같은 날 추가: 갭 필터의 전일 종가를 KIS 기준가(stck_sdpr, 공식 종가)로 우선 사용. 9/14 KRX 애프터마켓
+  (16:00~20:00 실시간) 도입 후 KIS 일봉 종가가 20:00 마지막 체결가가 되어 22:00에 수집한 DB 종가가
+  공식 종가와 ~80% 종목에서 달랐다(10/14·10/20·10/22 KRX CSV 대조, 차이 중앙값 0.5%, 최대 12%).
 - 같은 날 추가(사용자 요청): 체결 알림 + 장 마감 요약.
     · 체결 알림: 손절 매도/청산/부분익절/추가매수/신규진입 주문이 접수될 때마다 1건(쿨다운 없음).
       시장가 주문 "접수"까지만 확인하고 실제 체결가는 조회하지 않으므로, 가격은 "기록가(주문 시점
@@ -564,7 +567,9 @@ class IntradayStopMonitor:
                 market_data[ticker] = {
                     "current_price": quote["current_price"],
                     "current_high": quote.get("high") or quote["current_price"],
-                    "previous_close": daily["previous_close"] or quote.get("base_price"),
+                    # 【2026-10-30】KIS 기준가(공식 전일 종가) 우선 - DB 일봉 종가는 9/14 애프터마켓 도입 후
+                    # 20:00 마지막 체결가라 공식 종가와 다르다(변경이력 참고). 기준가가 없을 때만 DB 값.
+                    "previous_close": quote.get("base_price") or daily["previous_close"],
                     "price_change_pct": quote.get("change_pct"),
                     "atr20": daily["atr20"],
                     "lowest_10_days": daily["lowest_10_days"],

@@ -1,0 +1,15 @@
+[Unit]
+Description=MIE V2.0 - 당일 공식 종가 일봉 수집 (애프터마켓 16:00 시작 전, stock_price_history)
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mie-v2
+ExecStart=/opt/mie-v2/venv/bin/python -m market_intelligence.collectors.daily_close_collector
+StandardOutput=append:/var/log/mie-v2/daily_close.log
+StandardError=append:/var/log/mie-v2/daily_close.log
+Environment="PATH=/opt/mie-v2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+# 16:00 애프터마켓 전에 끝나야 하는 작업 - 코드가 15:59:30에 스스로 멈추지만 혹시 몰라 상한
+TimeoutStartSec=1500

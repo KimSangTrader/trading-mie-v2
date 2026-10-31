@@ -134,7 +134,7 @@ class TestPriceHistoryPipelineEndToEnd:
             stock_list=[],
             collector=MockPriceHistoryCollector({}),
         )
-        assert result == {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0}
+        assert result == {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0, "rows_updated": 0}
         assert session.query(StockPriceHistory).count() == 0
 
     def test_no_chart_data_for_symbol_saves_nothing_for_it(self, session):
@@ -198,5 +198,62 @@ class TestPriceHistoryPipelineWithPreCollectedRecords:
 
     def test_empty_records_saves_nothing_and_skips_db(self, session):
         result = run_full_price_history_pipeline(session, records=[])
-        assert result == {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0}
+        assert result == {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0, "rows_updated": 0}
         assert session.query(StockPriceHistory).count() == 0
+
+
+def _row(date, close, volume=1000, symbol="005930"):
+    return {"symbol": symbol, "market": "KOSPI", "date": date,
+            "open": close, "high": close, "low": close, "close": close, "volume": volume}
+
+
+class TestUpdateExisting:
+    """【2026-10-30】애프터마켓 도입 후 KIS가 다음날 공식 종가로 고쳐 주는 값을 DB에 반영."""
+
+    def _close(self, session, date):
+        return float(session.query(StockPriceHistory).filter_by(ticker="005930", trade_date=date).one().close)
+
+    def test_default_keeps_existing_rows(self, session):
+        run_full_price_history_pipeline(session, records=[_row("20261029", 230_500)])
+        result = run_full_price_history_pipeline(session, records=[_row("20261029", 232_000)])
+        assert result["rows_updated"] == 0
+        assert self._close(session, "20261029") == 230_500
+
+    def test_update_existing_overwrites_changed_values(self, session):
+        run_full_price_history_pipeline(session, records=[_row("20261029", 230_500, volume=25_500_000)])
+        result = run_full_price_history_pipeline(
+            session, records=[_row("20261029", 232_000, volume=24_975_596), _row("20261030", 220_500)],
+            update_existing=True,
+        )
+        assert (result["rows_saved"], result["rows_updated"]) == (1, 1)
+        assert self._close(session, "20261029") == 232_000
+        row = session.query(StockPriceHistory).filter_by(ticker="005930", trade_date="20261029").one()
+        assert int(row.volume) == 24_975_596
+
+    def test_unchanged_rows_are_not_counted(self, session):
+        run_full_price_history_pipeline(session, records=[_row("20261029", 232_000)])
+        result = run_full_price_history_pipeline(session, records=[_row("20261029", 232_000)], update_existing=True)
+        assert result["rows_updated"] == 0
+
+    def test_protected_date_keeps_existing_official_close(self, session):
+        """15:41 수집이 넣은 당일 공식 종가(225,000)를 22:00 임시 값(220,500)이 덮지 않는다."""
+        run_full_price_history_pipeline(session, records=[_row("20261030", 225_000)], update_existing=True)
+        result = run_full_price_history_pipeline(
+            session, records=[_row("20261029", 232_000), _row("20261030", 220_500)],
+            update_existing=True, protected_dates={"20261030"},
+        )
+        assert result["rows_updated"] == 0
+        assert self._close(session, "20261030") == 225_000
+
+    def test_protected_date_still_inserts_when_missing(self, session):
+        """15:41 수집이 실패해 당일 행이 없으면 임시 값이라도 넣는다(다음날 밤 공식 값으로 고쳐짐)."""
+        result = run_full_price_history_pipeline(
+            session, records=[_row("20261030", 220_500)], update_existing=True, protected_dates={"20261030"},
+        )
+        assert result["rows_saved"] == 1
+
+    def test_none_value_does_not_erase_existing(self, session):
+        run_full_price_history_pipeline(session, records=[_row("20261029", 232_000)])
+        record = dict(_row("20261029", 232_000), volume=None)
+        result = run_full_price_history_pipeline(session, records=[record], update_existing=True)
+        assert result["rows_updated"] == 0

@@ -27,6 +27,19 @@ PriceHistoryPipeline - 종목마스터→일봉 히스토리 수집→DB 저장 
   호출(및 그 안의 API 수집)을 건너뛰고, 이미 모아둔 행을 그대로 DB 중복 제거+저장
   로직에만 태운다 - collector/API를 아예 몰라도 되므로 테스트에서도 그대로 쓸 수
   있다(Mock collector를 안 만들어도 됨).
+
+【2026-10-30】update_existing / protected_dates 추가 - KRX 애프터마켓 대응
+- 배경: 2026-09-14 KRX 애프터마켓(16:00~20:00 실시간) 도입 후 KIS 일봉 API(FHKST03010100)는
+  "당일" 행의 종가/거래량을 20:00 마지막 체결가/애프터마켓 포함 거래량으로 주고, 하루가 지나면
+  공식 종가(15:30)로 고쳐서 준다(10/30 실측: 005930 10/30 당일 220,500 vs 15:30 225,000,
+  10/29 행은 다음날 조회 시 공식 232,000). 이 파이프라인은 신규 (ticker, trade_date)만 넣고
+  기존 행은 건드리지 않아서, 22:00에 처음 저장된 임시 값이 영구히 남았다(KRX CSV 대조 시
+  9/14 이후 ~80% 종목 종가 불일치).
+- update_existing=True면 이미 있는 행도 값이 다르면 덮어쓴다(rows_updated로 집계).
+  protected_dates에 든 거래일의 "기존" 행은 덮어쓰지 않는다 - 22:00 분석이 당일 행(임시 값)으로
+  15:41 수집(daily_close_collector.py)이 저장한 공식 종가를 덮지 않게 하기 위함. 기존 행이
+  없으면 protected여도 새로 넣는다(15:41 수집 실패 시 다음날 밤에 공식 값으로 고쳐짐).
+- 기본값(update_existing=False)은 기존 동작 그대로.
 ================================================================================
 """
 
@@ -47,6 +60,8 @@ def run_full_price_history_pipeline(
     checkpoint_every: int = 50,
     progress_callback: Optional[Any] = None,
     records: Optional[List[Dict[str, Any]]] = None,
+    update_existing: bool = False,
+    protected_dates: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     KOSPI/KOSDAQ 종목 → 일봉 히스토리 수집 → 신규 (ticker, trade_date)만 DB
@@ -72,7 +87,8 @@ def run_full_price_history_pipeline(
         {"total_symbols": 일봉 데이터가 하나라도 확보된 종목 수(조회 실패/데이터
          없음인 종목은 제외 - PriceHistoryCollector는 그런 종목에 대해 빈 행을
          만들지 않는다), "rows_fetched": 수집된 전체 행 수,
-         "rows_saved": 새로 DB에 저장한 행 수(이미 있던 거래일은 제외)}
+         "rows_saved": 새로 DB에 저장한 행 수(이미 있던 거래일은 제외),
+         "rows_updated": update_existing=True일 때 값이 달라 덮어쓴 기존 행 수}
         stock_list와 stock_master.get_stock_list() 결과가 모두 비어 있으면(records도
         없으면) {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0}
     """
@@ -87,7 +103,7 @@ def run_full_price_history_pipeline(
 
         if not stock_list:
             logger.warning("⚠️  처리할 종목이 없습니다 (빈 stock_list) - 파이프라인 중단")
-            return {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0}
+            return {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0, "rows_updated": 0}
 
         if collector is None:
             from data.price_history_collector import PriceHistoryCollector
@@ -103,24 +119,60 @@ def run_full_price_history_pipeline(
         )
     elif not records:
         logger.warning("⚠️  넘겨받은 records가 비어 있습니다 - 파이프라인 중단")
-        return {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0}
+        return {"total_symbols": 0, "rows_fetched": 0, "rows_saved": 0, "rows_updated": 0}
 
     tickers = sorted({r["symbol"] for r in records})
     existing_keys = set()
+    existing_values: Dict[tuple, tuple] = {}  # update_existing용 {(ticker, date): (id, o, h, l, c, v)}
     if tickers:
-        existing_rows = (
-            session.query(StockPriceHistory.ticker, StockPriceHistory.trade_date)
-            .filter(StockPriceHistory.ticker.in_(tickers))
-            .all()
-        )
-        existing_keys = {(t, d) for t, d in existing_rows}
+        if update_existing:
+            min_date = min(r["date"] for r in records)
+            existing_rows = (
+                session.query(StockPriceHistory.id, StockPriceHistory.ticker, StockPriceHistory.trade_date,
+                              StockPriceHistory.open, StockPriceHistory.high, StockPriceHistory.low,
+                              StockPriceHistory.close, StockPriceHistory.volume)
+                .filter(StockPriceHistory.ticker.in_(tickers), StockPriceHistory.trade_date >= min_date)
+                .all()
+            )
+            existing_values = {(r[1], r[2]): (r[0], *r[3:]) for r in existing_rows}
+            existing_keys = set(existing_values)
+            existing_keys |= {
+                (t, d) for t, d in session.query(StockPriceHistory.ticker, StockPriceHistory.trade_date)
+                .filter(StockPriceHistory.ticker.in_(tickers), StockPriceHistory.trade_date < min_date).all()
+            }
+        else:
+            existing_rows = (
+                session.query(StockPriceHistory.ticker, StockPriceHistory.trade_date)
+                .filter(StockPriceHistory.ticker.in_(tickers))
+                .all()
+            )
+            existing_keys = {(t, d) for t, d in existing_rows}
 
+    def _differs(old, new) -> bool:
+        if new is None:
+            return False  # 새 값이 비어 있으면 기존 값을 지우지 않는다
+        if old is None:
+            return True
+        return abs(float(old) - float(new)) > 1e-6
+
+    protected = protected_dates or set()
     saved = 0
+    updates: List[Dict[str, Any]] = []
+    seen = set()
     for record in records:
         key = (record["symbol"], record["date"])
+        if key in seen:
+            continue  # 같은 배치 안에서 중복 행이 와도 한 번만 처리
+        seen.add(key)
         if key in existing_keys:
+            if update_existing and key in existing_values and record["date"] not in protected:
+                row_id, *old = existing_values[key]
+                new = [record.get("open"), record.get("high"), record.get("low"), record.get("close"), record.get("volume")]
+                if any(_differs(o, n) for o, n in zip(old, new)):
+                    updates.append({"id": row_id, **{
+                        col: val for col, val in zip(("open", "high", "low", "close", "volume"), new) if val is not None
+                    }})
             continue
-        existing_keys.add(key)  # 같은 배치 안에서 중복 행이 와도 한 번만 저장
 
         session.add(StockPriceHistory(
             ticker=record["symbol"],
@@ -134,12 +186,15 @@ def run_full_price_history_pipeline(
         ))
         saved += 1
 
+    if updates:
+        session.bulk_update_mappings(StockPriceHistory, updates)
     session.commit()
     logger.info(
         f"✅ 일봉 히스토리 파이프라인 완료: {len(tickers)}종목, "
-        f"{len(records)}행 수집 중 {saved}행 신규 저장"
+        f"{len(records)}행 수집 중 {saved}행 신규 저장, {len(updates)}행 갱신"
     )
-    return {"total_symbols": len(tickers), "rows_fetched": len(records), "rows_saved": saved}
+    return {"total_symbols": len(tickers), "rows_fetched": len(records), "rows_saved": saved,
+            "rows_updated": len(updates)}
 
 
 if __name__ == "__main__":

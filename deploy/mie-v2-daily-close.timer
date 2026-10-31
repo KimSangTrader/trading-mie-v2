@@ -1,0 +1,12 @@
+[Unit]
+Description=MIE V2.0 - 당일 공식 종가 일봉 수집 (평일 15:41 KST, 2026-10-30 신규 - KRX 애프터마켓 대응)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:41:00 Asia/Seoul
+# Persistent=false: 놓친 실행을 16:00 이후에 따라잡으면 애프터마켓 임시 값이 되므로 따라잡지 않는다
+# (코드도 16:00 이후 시작이면 쓰지 않음). 놓친 날은 22:00 분석 + 다음날 밤 자동 보정으로 처리.
+Persistent=false
+Unit=mie-v2-daily-close.service
+
+[Install]
+WantedBy=timers.target
